@@ -62,3 +62,12 @@ Generated-in-code art is original and has no file to list: the UI icon set (`cra
 | craft-fonts (optional build input, not files in this repo): BIZ UDPGothic, BIZ UDMincho, Shippori Mincho | see https://github.com/storytold/craft-fonts/blob/main/ATTRIBUTION.md | embedded only when built with `CRAFT_FONTS_DIR` (all official releases) | OFL-1.1 | Japanese UI and document fallback |
 | `crates/ui-egui/src/i18n/uk.tsv` | @dmatviichuk with Codex | Original translation from the English interface labels in this repository; no other product localisation copied | MIT OR Apache-2.0 | Ukrainian interface catalog; spelling checked with external VESUM and ULIF dictionaries, neither bundled |
 | `crates/ui-egui/src/i18n/pt-br.tsv` | @edurbs with ZCode | Original translation from the English interface labels in this repository; no other product localisation copied | MIT OR Apache-2.0 | Brazilian Portuguese interface catalog; spelling checked with the external pt_BR Hunspell dictionary, not bundled |
+
+## Data compiled in from dependencies
+
+Not files in this repository (so not in the table above), but built into the binary:
+
+| Data | Crate | Source | Licence | Notes |
+|---|---|---|---|---|
+| English dictionary and annotations (`dictionary.dict`, `annotations.json`) | `harper-core` 2.11 (grammar, `crates/proof/src/harper.rs`) | SCOWL-derived; en-GB/CA/AU words from MIT-licensed dictionaries (per [harper#4468](https://github.com/Automattic/harper/issues/4468)) | Apache-2.0 (Harper); SCOWL's permissive notice applies to the word list | Harper's own spell check is off; our spelling uses the Moby list |
+| Brill POS tagger, Brill chunker, Burn LSTM chunker (`trained_tagger_model.json`, `trained_chunker_model.json`, `finished_chunker/model.mpk`, `finished_chunker/vocab.json`) | `harper-brill` (required by `harper-core`) | Trained by the Harper project on Universal Dependencies treebanks: UD_English-GUM, UD_English-EWT, UD_English-LinES | Crate: Apache-2.0. **Training corpora: GUM and LinES CC BY-NC-SA 4.0, EWT CC BY-SA 4.0** | **Unresolved:** whether the trained models carry the corpora's non-commercial / share-alike terms is open upstream ([harper#4468](https://github.com/Automattic/harper/issues/4468)). Accepted by the owner for local, personal builds (2026-10-10); review before any public or commercial distribution |

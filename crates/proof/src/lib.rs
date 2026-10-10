@@ -3,12 +3,15 @@
 //! - **Spelling** against the public-domain Moby word list (~160k words, the same list that
 //!   drives hyphenation), with inflections (`-s`, `-es`, `-ed`, `-ing`, `-ly`, `'s`…), a user
 //!   dictionary and ignore lists; suggestions by edit distance.
-//! - **Grammar** checks that are cheap and reliable: repeated words, `a`/`an`, capital letter
-//!   after a sentence end, spaces before punctuation, doubled spaces.
+//! - **Grammar**: [Harper](harper)'s rule set (agreement, word choice, typos…) on top of our own
+//!   checks: repeated words, `a`/`an`, capital letter after a sentence end, spaces before
+//!   punctuation, doubled spaces, he/she/it with a plain verb ("it do"), informal spellings ("I
+//!   dun think").
 //! - **Hyphenation** ([`hyphen`]): dictionary, Liang patterns, heuristic.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod dict;
+pub mod harper;
 pub mod hyphen;
 pub mod patterns;
 
@@ -413,7 +416,128 @@ pub fn check_grammar(text: &str) -> Vec<Issue> {
         let next_non_space = tail.trim_start_matches(['"', '”', ')', '\'']).chars().next();
         after_end = matches!(next_non_space, Some('.' | '!' | '?')) && tail.trim_start_matches(['.', '!', '?', '"', '”', ')']).starts_with(' ');
     }
+    v.extend(check_agreement(text, &ws));
+    // Harper's findings, except where one of ours already covers that text.
+    let ours: Vec<(usize, usize)> = v.iter().map(|i| (i.start, i.end)).collect();
+    v.extend(harper::check(text).into_iter().filter(|h| !ours.iter().any(|&(a, b)| a < h.end && h.start < b)));
     v.sort_by_key(|i| i.start);
+    v
+}
+
+/// Plain verbs and their third-person singular forms ("it do" → "it does").
+const THIRD_PERSON: &[(&str, &str)] = &[
+    ("do", "does"),
+    ("have", "has"),
+    ("go", "goes"),
+    ("say", "says"),
+    ("want", "wants"),
+    ("need", "needs"),
+    ("like", "likes"),
+    ("know", "knows"),
+    ("think", "thinks"),
+    ("make", "makes"),
+    ("take", "takes"),
+    ("come", "comes"),
+    ("get", "gets"),
+    ("seem", "seems"),
+    ("look", "looks"),
+    ("work", "works"),
+];
+
+/// Words before "he/she/it" that take a plain verb after it ("does it work", "let it go", "saw
+/// it come").
+const BARE_VERB_BEFORE: &[&str] = &[
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "can",
+    "could",
+    "shall",
+    "should",
+    "may",
+    "might",
+    "must",
+    "to",
+    "let",
+    "lets",
+    "make",
+    "makes",
+    "made",
+    "help",
+    "helps",
+    "helped",
+    "see",
+    "sees",
+    "saw",
+    "watch",
+    "watched",
+    "hear",
+    "heard",
+    "feel",
+    "felt",
+    "have",
+    "had",
+    "not",
+    "doesn't",
+    "didn't",
+    "won't",
+    "wouldn't",
+    "can't",
+    "couldn't",
+    "shouldn't",
+    "mustn't",
+    "if",
+    "lest",
+    "that",
+    "whether",
+];
+
+/// Agreement and informal spellings the other checks miss: "it do" → "it does", "I dun think" →
+/// "I don't think", "like dis." → "like this.".
+fn check_agreement(text: &str, ws: &[(usize, usize)]) -> Vec<Issue> {
+    let word = |i: usize| ws.get(i).and_then(|&(a, b)| text.get(a..b));
+    // Only a single space between two words counts as "next to" each other.
+    let adjacent = |i: usize| match (ws.get(i), ws.get(i + 1)) {
+        (Some(&(_, b0)), Some(&(a1, _))) => text.get(b0..a1) == Some(" "),
+        _ => false,
+    };
+    let mut v = Vec::new();
+    for i in 0..ws.len() {
+        let (Some(w), Some(&(a, b))) = (word(i), ws.get(i)) else { continue };
+        let lw = w.to_lowercase();
+        // he/she/it + plain verb, unless something before it calls for the plain verb.
+        if matches!(lw.as_str(), "he" | "she" | "it")
+            && adjacent(i)
+            && !i.checked_sub(1).and_then(word).is_some_and(|p| BARE_VERB_BEFORE.contains(&p.to_lowercase().as_str()))
+            && let (Some(next), Some(&(na, nb))) = (word(i + 1), ws.get(i + 1))
+            && let Some((_, third)) = THIRD_PERSON.iter().find(|(plain, _)| *plain == next)
+        {
+            v.push(Issue {
+                start: na,
+                end: nb,
+                kind: IssueKind::Grammar,
+                message: format!("Use \"{third}\" with \"{w}\""),
+                suggestions: vec![(*third).to_string()],
+            });
+        }
+        // "I/we/you/they dun": informal "don't" (or "done").
+        if lw == "dun" && i.checked_sub(1).and_then(word).is_some_and(|p| matches!(p.to_lowercase().as_str(), "i" | "we" | "you" | "they")) {
+            v.push(Issue {
+                start: a,
+                end: b,
+                kind: IssueKind::Grammar,
+                message: "Informal spelling".into(),
+                suggestions: vec!["don't".into(), "done".into()],
+            });
+        }
+        // "dis" with no word after it ("like dis.") is "this"; "dis him" is the verb.
+        if lw == "dis" && !adjacent(i) {
+            let fixed = if w.starts_with('D') { "This" } else { "this" };
+            v.push(Issue { start: a, end: b, kind: IssueKind::Grammar, message: "Informal spelling".into(), suggestions: vec![fixed.into()] });
+        }
+    }
     v
 }
 
@@ -425,6 +549,54 @@ fn starts_consonant_sound(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What grammar flags in `t`: (flagged text, first suggestion).
+    fn grammar(t: &str) -> Vec<(String, String)> {
+        check_grammar(t)
+            .into_iter()
+            .map(|i| (t.get(i.start..i.end).unwrap_or("").to_string(), i.suggestions.first().cloned().unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn grammar_catches_agreement_and_informal_spellings() {
+        let g = grammar("I dun think it do be like it dis.");
+        assert_eq!(g, [("dun".into(), "don't".into()), ("do".into(), "does".into()), ("dis".into(), "this".into())]);
+    }
+
+    #[test]
+    fn grammar_from_harper() {
+        assert!(grammar("He don't know.").contains(&("don't".into(), "doesn't".into())));
+        assert!(grammar("I could of done it.").contains(&("could of".into(), "could have".into())));
+        assert!(grammar("Sit with teh dog.").iter().any(|(w, s)| w == "teh" && s == "the"));
+    }
+
+    #[test]
+    fn grammar_leaves_correct_text_alone() {
+        for t in [
+            "Does it work? Let it go. I saw it come. It works.",
+            "They dis him at every turn.",
+            "She has a dog, and he likes it.",
+            "Whether it work or not, we go on.",
+            "I think we should go now.",
+        ] {
+            assert_eq!(grammar(t), Vec::<(String, String)>::new(), "{t}");
+        }
+    }
+
+    #[test]
+    fn grammar_ranges_are_bytes_on_char_boundaries() {
+        // Harper counts chars: multi-byte text before the issue must map to the right bytes.
+        let t = "Café über alles — he don't know.";
+        let i = check_grammar(t).into_iter().find(|i| t.get(i.start..i.end) == Some("don't"));
+        assert!(i.is_some(), "{:?}", grammar(t));
+    }
+
+    #[test]
+    fn our_checks_win_over_harper_on_the_same_text() {
+        // One issue for a repeated word, not ours and Harper's.
+        assert_eq!(grammar("It was the the end.").len(), 1);
+    }
 
     #[test]
     fn dictionary_loads() {

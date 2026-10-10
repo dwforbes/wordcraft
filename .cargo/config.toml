@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Harper's chunker (burn → rand → getrandom 0.3) needs a randomness source on the web: the
+# browser's crypto API. getrandom wants this cfg as well as its `wasm_js` feature
+# (crates/proof/Cargo.toml).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

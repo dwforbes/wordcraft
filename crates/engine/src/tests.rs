@@ -1582,3 +1582,19 @@ fn ignore_once_needs_an_issue_and_drops_out_of_the_issue_list() {
     s.set_document(wordcraft_doc::Document::new());
     assert!(s.proof_ignored.is_empty());
 }
+
+#[test]
+fn spelling_and_grammar_finds_nonstandard_grammar() {
+    // Reported: the check completed with nothing found on this sentence.
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "I dun think it do be like it dis. He don't know."}));
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(spelling_walk(&mut s, 10), ["dun", "do", "dis", "don't"]);
+    // Change goes through the same path for grammar as for spelling.
+    run(&mut s, "caret.docStart", json!({}));
+    s.proof_ignored.clear();
+    let r = run(&mut s, "review.spelling", json!({}));
+    assert_eq!((r["kind"].as_str(), r["suggestions"][0].as_str()), (Some("grammar"), Some("don't")));
+    run(&mut s, "review.applySuggestion", json!({"text": "don't"}));
+    assert!(text(&s).starts_with("I don't think it do"));
+}

@@ -3,7 +3,7 @@ name = "wordcraft-proof"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "WordCraft proofing: spelling (public-domain word list), suggestions, grammar checks, hyphenation"
+description = "WordCraft proofing: spelling (public-domain word list), suggestions, grammar (Harper + own checks), hyphenation"
 
 [lints]
 workspace = true
@@ -11,6 +11,12 @@ workspace = true
 [dependencies]
 log = { workspace = true }
 miniz_oxide = "0.8"
+# Grammar rules (Apache-2.0); the thesaurus feature is left out.
+harper-core = { version = "2.11", default-features = false, features = ["concurrent"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# For Harper on the web; see .cargo/config.toml.
+getrandom = { version = "0.3", features = ["wasm_js"] }
