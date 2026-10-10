@@ -877,3 +877,9 @@
 	Opening print dialog…	正在開啟列印對話方塊…
 	Print failed: {error}	列印失敗：{error}
 	Couldn't open {path}: {error}	無法開啟 {path}：{error}
+	Ignore Once	略過一次
+	Suggestions	建議
+	Check Again	重新檢查
+	Spelling	拼字
+	Grammar	文法
+	The spelling and grammar check is complete.	拼字與文法檢查已完成。

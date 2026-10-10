@@ -131,6 +131,9 @@ pub struct WordApp {
     pub previews: previews::Previews,
     /// Media key of the picture a pending Change Picture replaces (#147).
     pub change_picture_target: Option<String>,
+    /// The Spelling & Grammar pane is open, showing this issue (`review.spelling`'s result,
+    /// `{"done": true}` once the check is complete).
+    pub proofing: Option<Value>,
     /// macOS: the window has no title bar; leave room for the traffic lights.
     pub integrated_titlebar: bool,
     control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
@@ -220,6 +223,7 @@ impl WordApp {
             read_aloud_error: None,
             autosave_path: None,
             change_picture_target: None,
+            proofing: None,
         }
     }
 
@@ -311,6 +315,7 @@ impl WordApp {
         // "Save changes?" and AutoSave's go-ahead were both about the old one.
         if self.session.document_id() != document {
             self.autosave_path = None;
+            self.proofing = None;
             if matches!(self.dialog, Some(dialogs::Dialog::SaveChanges { .. })) {
                 self.dialog = None;
             }
@@ -322,6 +327,12 @@ impl WordApp {
             && v.get("path").and_then(Value::as_str).map(std::path::Path::new) == self.session.path.as_deref()
         {
             self.autosave_path = self.session.path.clone();
+        }
+        // Spelling & Grammar (F7, the ribbon, Home › Editor) shows what it found in its pane.
+        if let Ok(v) = &r
+            && matches!(id, "review.spelling" | "review.editor")
+        {
+            self.proofing = Some(v.clone());
         }
         self.after_command(id);
         if let Err(e) = &r {
@@ -454,6 +465,14 @@ impl WordApp {
             "ui.closeDialog" => {
                 self.dialog = None;
                 json!({})
+            }
+            "ui.proofingPane" => {
+                // Opening it runs the check (F7); closing it just hides it.
+                if p.get("value").and_then(Value::as_bool).unwrap_or(self.proofing.is_none()) {
+                    return Some(self.execute("review.spelling", json!({})));
+                }
+                self.proofing = None;
+                json!({"value": false})
             }
             "ui.changePicture" => {
                 let Some(media) = self.selected_picture_media() else {
@@ -925,6 +944,46 @@ mod tests {
 
     fn app() -> WordApp {
         WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default())
+    }
+
+    /// Spelling & Grammar used to do nothing visible: F7 opens the pane with the issue, the
+    /// pane's buttons act on it and move on, and a finished check says so.
+    #[test]
+    fn spelling_pane_walks_the_issues() {
+        let mut a = app();
+        a.execute("text.insert", json!({"text": "A sentance and a blorfle."})).unwrap();
+        a.execute("caret.docStart", json!({})).unwrap();
+        a.run("review.spelling", json!({})).unwrap();
+        let issue = a.proofing.clone().unwrap();
+        assert_eq!(issue["text"], "sentance");
+        panes::proof_act(&mut a, &issue, "review.applySuggestion", json!({"text": "sentence"}));
+        assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body).trim_end(), "A sentence and a blorfle.");
+        let issue = a.proofing.clone().unwrap();
+        assert_eq!(issue["text"], "blorfle");
+        panes::proof_act(&mut a, &issue, "review.ignoreOnce", json!({}));
+        assert_eq!(a.proofing, Some(json!({"done": true})));
+        a.execute("ui.proofingPane", json!({"value": false})).unwrap();
+        assert!(a.proofing.is_none());
+    }
+
+    /// An edit under the pane: its issue is gone, so the pane looks again instead of changing
+    /// whatever is at the old offsets.
+    #[test]
+    fn spelling_pane_refreshes_a_stale_issue() {
+        let mut a = app();
+        a.execute("text.insert", json!({"text": "A wuggle and a zibbet."})).unwrap();
+        a.execute("caret.docStart", json!({})).unwrap();
+        a.execute("ui.proofingPane", json!({"value": true})).unwrap();
+        let issue = a.proofing.clone().unwrap();
+        assert_eq!(issue["text"], "wuggle");
+        a.execute("select.range", json!({"anchor": issue["start"], "focus": issue["end"]})).unwrap();
+        a.execute("text.insert", json!({"text": "word"})).unwrap();
+        panes::proof_act(&mut a, &issue, "review.applySuggestion", json!({"text": "juggle"}));
+        assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body).trim_end(), "A word and a zibbet.");
+        assert_eq!(a.proofing.as_ref().map(|p| p["text"].clone()), Some(json!("zibbet")));
+        // A new document closes the pane.
+        a.execute("file.new", json!({})).unwrap();
+        assert!(a.proofing.is_none());
     }
 
     /// Issue #139: Ctrl+wheel over the page didn't zoom.

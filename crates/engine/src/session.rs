@@ -210,6 +210,9 @@ pub struct Session {
     pub math_latex: bool,
     /// Text typed into equations is normal (non-math) text.
     pub math_normal_text: bool,
+    /// Proofing issues skipped with Ignore Once: story, paragraph, byte range and the text it
+    /// covered (a key that no longer matches after an edit just stops applying).
+    pub proof_ignored: Vec<(StoryRef, wordcraft_doc::Path, usize, usize, String)>,
 }
 
 /// The equation being edited.
@@ -283,6 +286,7 @@ impl Session {
             math_normal_text: false,
             prefs: Prefs::default(),
             read_aloud: Default::default(),
+            proof_ignored: Vec::new(),
         }
     }
 
@@ -415,6 +419,7 @@ impl Session {
         self.doc.ensure_nonempty();
         self.sel = Selection::caret(self.doc.start_of(StoryRef::Body));
         self.pending = None;
+        self.proof_ignored.clear();
         self.reset_history();
         self.touch();
         self.dirty = false;
@@ -481,6 +486,7 @@ impl Session {
             math: _,
             math_latex: _,
             math_normal_text: _,
+            proof_ignored: _,
         } = self;
         let head = if history.len() + SNAPSHOT_HEAD > MAX_UNDO { history.iter().take(SNAPSHOT_HEAD).cloned().collect() } else { Vec::new() };
         EditSnapshot {

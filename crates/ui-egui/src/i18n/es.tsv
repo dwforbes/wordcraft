@@ -893,3 +893,9 @@
 	Opening print dialog…	Abriendo el cuadro de diálogo de impresión…
 	Print failed: {error}	Error al imprimir: {error}
 	Couldn't open {path}: {error}	No se pudo abrir {path}: {error}
+	Ignore Once	Omitir una vez
+	Suggestions	Sugerencias
+	Check Again	Volver a revisar
+	Spelling	Ortografía
+	Grammar	Gramática
+	The spelling and grammar check is complete.	La revisión ortográfica y gramatical ha terminado.

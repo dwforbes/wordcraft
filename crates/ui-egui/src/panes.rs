@@ -1,4 +1,4 @@
-//! Side panes: Navigation (headings, pages, search results), Styles, Comments.
+//! Side panes: Navigation (headings, pages, search results), Styles, Comments, Spelling & Grammar.
 
 use egui::{Stroke, Ui, vec2};
 use serde_json::{Value, json};
@@ -30,6 +30,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             .frame(egui::Frame::NONE.fill(t.panel).inner_margin(10).stroke(Stroke::new(1.0, t.border)))
             .show(ui, |ui| comments(app, ui));
     }
+    if app.proofing.is_some() {
+        egui::Panel::right("proofing_pane")
+            .default_size(270.0)
+            .resizable(true)
+            .frame(egui::Frame::NONE.fill(t.panel).inner_margin(10).stroke(Stroke::new(1.0, t.border)))
+            .show(ui, |ui| proofing(app, ui));
+    }
 }
 
 fn header(ui: &mut Ui, title: &str) -> bool {
@@ -37,7 +44,14 @@ fn header(ui: &mut Ui, title: &str) -> bool {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(tl!(title)).font(semibold(15.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("✕").clicked() {
+            // Drawn, not "✕": the UI font has no such glyph.
+            let t = Tokens::get(ui.ctx());
+            let (r, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, 4.0, t.hover);
+            }
+            crate::icons::paint(ui.painter(), r.shrink(3.0), "close", t.icon, t.accent);
+            if resp.on_hover_text(tl!("Close")).clicked() {
                 close = true;
             }
         });
@@ -263,4 +277,92 @@ fn comments(app: &mut WordApp, ui: &mut Ui) {
         }
     });
     let _ = vec2(0.0, 0.0);
+}
+
+/// Spelling & Grammar: the issue F7 selected, its suggestions, and Ignore / Add / Change, each
+/// moving on to the next issue.
+fn proofing(app: &mut WordApp, ui: &mut Ui) {
+    let Some(issue) = app.proofing.clone() else { return };
+    let str_of = |k: &str| issue.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let done = issue.get("done").is_some();
+    let spelling = str_of("kind") == "spelling";
+    let title = if done {
+        "Editor"
+    } else if spelling {
+        "Spelling"
+    } else {
+        "Grammar"
+    };
+    if header(ui, title) {
+        let _ = app.run("ui.proofingPane", json!({"value": false}));
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    if done {
+        ui.label(tl!("The spelling and grammar check is complete."));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(tl!("Check Again")).clicked() {
+                let _ = app.run("caret.docStart", json!({}));
+                let _ = app.run("review.spelling", json!({}));
+            }
+            if ui.button(tl!("Close")).clicked() {
+                let _ = app.run("ui.proofingPane", json!({"value": false}));
+            }
+        });
+        return;
+    }
+    ui.label(egui::RichText::new(str_of("message")).small().color(t.text_dim));
+    ui.add_space(4.0);
+    egui::Frame::NONE.fill(t.input).stroke(Stroke::new(1.0, t.border)).corner_radius(6).inner_margin(8).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(str_of("text")).font(semibold(15.0)).color(if spelling { t.red } else { t.blue }));
+    });
+    ui.add_space(8.0);
+    let sugg: Vec<String> = issue
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    ui.label(egui::RichText::new(tl!("Suggestions")).font(semibold(12.0)));
+    if sugg.is_empty() {
+        ui.label(egui::RichText::new(tl!("(no suggestions)")).italics().color(t.text_dim));
+    }
+    for sg in sugg {
+        let label = if sg.is_empty() { tl!("Delete").to_string() } else { sg.clone() };
+        if ui.add_sized(vec2(ui.available_width(), 24.0), egui::Button::new(egui::RichText::new(label).strong())).clicked() {
+            proof_act(app, &issue, "review.applySuggestion", json!({"text": sg}));
+        }
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(tl!("Ignore Once")).clicked() {
+            proof_act(app, &issue, "review.ignoreOnce", json!({}));
+        }
+        if spelling {
+            if ui.button(tl!("Ignore All")).clicked() {
+                proof_act(app, &issue, "review.ignoreAll", json!({}));
+            }
+            if ui.button(tl!("Add to Dictionary")).clicked() {
+                proof_act(app, &issue, "review.addToDictionary", json!({}));
+            }
+        }
+    });
+}
+
+/// Act on the pane's issue and move on to the next one. If the document changed under the pane
+/// and the issue is no longer there, look again from where it was instead.
+pub(crate) fn proof_act(app: &mut WordApp, issue: &Value, id: &str, params: Value) {
+    let (Some(start), Some(end)) = (issue.get("start").cloned(), issue.get("end").cloned()) else { return };
+    let now = app.session.run("review.suggestions", &json!({"pos": start})).unwrap_or_default();
+    let same = now.get("start") == Some(&start) && now.get("end") == Some(&end) && now.get("text") == issue.get("text");
+    if !same {
+        let _ = app.run("caret.set", json!({"pos": start}));
+        let _ = app.run("review.spelling", json!({}));
+        return;
+    }
+    let _ = app.run("select.range", json!({"anchor": start, "focus": end}));
+    let _ = app.run(id, params);
+    let _ = app.run("review.spelling", json!({}));
 }

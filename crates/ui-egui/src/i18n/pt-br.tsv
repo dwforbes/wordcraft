@@ -888,3 +888,9 @@
 	Opening print dialog…	Abrindo a caixa de diálogo de impressão…
 	Print failed: {error}	Falha na impressão: {error}
 	Couldn't open {path}: {error}	Não foi possível abrir {path}: {error}
+	Ignore Once	Ignorar uma vez
+	Suggestions	Sugestões
+	Check Again	Verificar novamente
+	Spelling	Ortografia
+	Grammar	Gramática
+	The spelling and grammar check is complete.	A verificação de ortografia e gramática terminou.

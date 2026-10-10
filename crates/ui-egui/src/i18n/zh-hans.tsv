@@ -887,3 +887,9 @@
 	Opening print dialog…	正在打开打印对话框…
 	Print failed: {error}	打印失败：{error}
 	Couldn't open {path}: {error}	无法打开 {path}：{error}
+	Ignore Once	忽略一次
+	Suggestions	建议
+	Check Again	重新检查
+	Spelling	拼写
+	Grammar	语法
+	The spelling and grammar check is complete.	拼写和语法检查已完成。

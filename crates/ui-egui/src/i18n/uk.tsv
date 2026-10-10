@@ -888,3 +888,9 @@
 	Opening print dialog…	Відкриття діалогу друку…
 	Print failed: {error}	Не вдалося надрукувати: {error}
 	Couldn't open {path}: {error}	Не вдалося відкрити {path}: {error}
+	Ignore Once	Пропустити один раз
+	Suggestions	Пропозиції
+	Check Again	Перевірити знову
+	Spelling	Орфографія
+	Grammar	Граматика
+	The spelling and grammar check is complete.	Перевірку орфографії та граматики завершено.

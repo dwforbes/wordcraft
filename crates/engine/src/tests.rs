@@ -1502,3 +1502,83 @@ fn styles_apply_rejected_on_protected_document() {
     assert_eq!(para_style(&s, 0), None);
     assert_eq!(s.undo_labels(), undo);
 }
+
+/// Words Spelling & Grammar walks through, in order, until it reports done (at most `max`).
+fn spelling_walk(s: &mut Session, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for _ in 0..max {
+        let r = run(s, "review.spelling", json!({}));
+        if r.get("done").is_some() {
+            break;
+        }
+        out.push(r["text"].as_str().unwrap_or("").to_string());
+        run(s, "review.ignoreOnce", json!({}));
+    }
+    out
+}
+
+#[test]
+fn spelling_advances_past_the_selected_issue() {
+    // One paragraph: F7 used to find the first issue again and again.
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "One blorfle and one zibbet here."}));
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "blorfle");
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "zibbet");
+    // The only other issue is behind us: wrap to the top.
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "blorfle");
+}
+
+#[test]
+fn spelling_check_wraps_once_and_completes() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "A blorfle first."}));
+    run(&mut s, "text.newParagraph", json!({}));
+    run(&mut s, "text.insert", json!({"text": "Then zibbet and wuggle."}));
+    // Start in the middle (after "zibbet"): the rest, then the top, then done.
+    let p = json!({"story": "body", "path": [1], "off": "Then zibbet".len()});
+    run(&mut s, "select.range", json!({"anchor": p, "focus": p}));
+    assert_eq!(spelling_walk(&mut s, 10), ["wuggle", "blorfle", "zibbet"]);
+    assert_eq!(s.status, "The spelling and grammar check is complete.");
+    // Everything was ignored once: the next check finds nothing.
+    assert_eq!(run(&mut s, "review.spelling", json!({})), json!({"done": true}));
+}
+
+#[test]
+fn spelling_from_a_caret_inside_a_word_checks_that_word() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Some blorfle."}));
+    let p = json!({"story": "body", "path": [0], "off": 7});
+    run(&mut s, "select.range", json!({"anchor": p, "focus": p}));
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "blorfle");
+}
+
+#[test]
+fn spelling_change_then_next() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "A sentance with a zibbet."}));
+    run(&mut s, "caret.docStart", json!({}));
+    let r = run(&mut s, "review.spelling", json!({}));
+    assert_eq!(r["text"], "sentance");
+    assert_eq!(r["suggestions"][0], "sentence");
+    run(&mut s, "review.applySuggestion", json!({"text": "sentence"}));
+    assert_eq!(text(&s).trim_end(), "A sentence with a zibbet.");
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "zibbet");
+}
+
+#[test]
+fn ignore_once_needs_an_issue_and_drops_out_of_the_issue_list() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Fine words only."}));
+    assert!(s.run("review.ignoreOnce", &json!({})).is_err());
+    assert!(s.run("review.ignoreAll", &json!({})).is_err());
+    run(&mut s, "text.insert", json!({"text": " A wuggle."}));
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "review.spelling", json!({}));
+    assert_eq!(run(&mut s, "review.issues", json!({})).as_array().map(Vec::len), Some(1));
+    run(&mut s, "review.ignoreOnce", json!({}));
+    assert_eq!(run(&mut s, "review.issues", json!({})), json!([]));
+    // A new document starts with nothing ignored.
+    s.set_document(wordcraft_doc::Document::new());
+    assert!(s.proof_ignored.is_empty());
+}

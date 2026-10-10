@@ -876,3 +876,9 @@
 	Opening print dialog…	印刷ダイアログを開いています…
 	Print failed: {error}	印刷できませんでした: {error}
 	Couldn't open {path}: {error}	{path} を開けませんでした: {error}
+	Ignore Once	1 回だけ無視
+	Suggestions	候補
+	Check Again	もう一度チェック
+	Spelling	スペル
+	Grammar	文法
+	The spelling and grammar check is complete.	スペルと文法のチェックが終わりました。

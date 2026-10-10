@@ -61,6 +61,7 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .params(r#"{"word"?: string}"#)
         .pure(),
+        CommandSpec::new("review.ignoreOnce", "Ignore Once", "Review › Proofing", ignore_once).params(r#"{"pos"?: Pos}"#).pure(),
         CommandSpec::new("review.ignoreAll", "Ignore All", "Review › Proofing", |s, v| {
             let w = match p::str(v, "word") {
                 Some(w) => w.to_string(),
@@ -68,10 +69,14 @@ pub fn specs() -> Vec<CommandSpec> {
                     .map(|(a, b, _)| s.doc.para_at(&a).and_then(|p| p.text.get(a.off..b.off).map(str::to_string)).unwrap_or_default())
                     .unwrap_or_default(),
             };
+            if w.is_empty() {
+                return Err(CmdError::Params("no word".into()));
+            }
             wordcraft_proof::add_word(&w);
             s.relayout();
             Ok(json!({"ignored": w}))
         })
+        .params(r#"{"word"?: string}"#)
         .pure(),
         CommandSpec::new("review.applySuggestion", "Change", "Review › Proofing", |s, v| {
             let text = p::req_str(v, "text")?.to_string();
@@ -399,7 +404,10 @@ fn para_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<
     v.extend(wordcraft_proof::check_grammar(&text));
     v.sort_by_key(|i| i.start);
     v.into_iter()
-        .filter(|i| !p.run_ranges().any(|(r, c)| r.start < i.end && i.start < r.end && (c.no_proof == Some(true) || c.link.is_some())))
+        .filter(|i| {
+            !p.run_ranges()
+                .any(|(r, c)| r.start < i.end && i.start < r.end && (c.no_proof == Some(true) || c.hidden == Some(true) || c.link.is_some()))
+        })
         .map(|i| (Pos { story, path: path.clone(), off: i.start }, Pos { story, path: path.clone(), off: i.end }, i))
         .collect()
 }
@@ -415,18 +423,42 @@ fn issue_json(s: &Session, a: &Pos, b: &Pos, i: &wordcraft_proof::Issue) -> Valu
     json!({"start": pos_json(a), "end": pos_json(b), "text": word, "kind": if i.kind == wordcraft_proof::IssueKind::Spelling { "spelling" } else { "grammar" }, "message": i.message, "suggestions": sugg})
 }
 
-/// F7: select the next issue after the caret and return it with suggestions.
+/// The text an issue covers.
+fn issue_text(s: &Session, a: &Pos, b: &Pos) -> String {
+    s.doc.para_at(a).and_then(|p| p.text.get(a.off..b.off)).unwrap_or("").to_string()
+}
+
+/// The issue was skipped with Ignore Once (and still covers the same text).
+fn ignored_once(s: &Session, a: &Pos, b: &Pos) -> bool {
+    s.proof_ignored.iter().any(|(st, path, x, y, t)| *st == a.story && *path == a.path && *x == a.off && *y == b.off && *t == issue_text(s, a, b))
+}
+
+/// Issues Spelling & Grammar walks through: everything but what was ignored once.
+fn open_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, wordcraft_proof::Issue)> {
+    para_issues(s, story, path).into_iter().filter(|(a, b, _)| !ignored_once(s, a, b)).collect()
+}
+
+/// F7: select the next issue after the selection (or the one the caret is in) and return it
+/// with suggestions. The check runs to the end of the story, then wraps around from the top
+/// back to where it started; with nothing left it reports `{"done": true}`.
 fn next_issue(s: &mut Session, _: &Value) -> CmdResult {
-    let caret = s.sel.ordered().1;
-    let story = caret.story;
+    let (first, last) = s.sel.ordered();
+    let story = last.story;
     let paths = s.doc.para_paths(story);
-    let start = paths.iter().position(|p| *p == caret.path).unwrap_or(0);
-    for k in 0..paths.len() {
-        let Some(path) = paths.get((start + k) % paths.len().max(1)) else { break };
-        for (a, b, i) in para_issues(s, story, path) {
-            if k == 0 && a.off < caret.off && start + k < paths.len() && paths.len() > 1 {
-                continue;
-            }
+    let (start, off) = paths.iter().position(|p| *p == last.path).map(|i| (i, last.off)).unwrap_or((0, 0));
+    // After a selection (a selected issue is done with) the check starts at its end; from a
+    // caret it starts with the word the caret is in.
+    let after = |a: &Pos, b: &Pos| if first == last { b.off > off } else { a.off >= off };
+    let n = paths.len();
+    for k in 0..=n {
+        let Some(path) = paths.get((start + k) % n.max(1)) else { continue };
+        // The start paragraph comes up twice: after the start point first, before it on the wrap.
+        let hit = open_issues(s, story, path).into_iter().find(|(a, b, _)| match k {
+            0 => after(a, b),
+            k if k == n => !after(a, b),
+            _ => true,
+        });
+        if let Some((a, b, i)) = hit {
             let r = issue_json(s, &a, &b, &i);
             s.sel = Selection { anchor: a, focus: b };
             return Ok(r);
@@ -436,10 +468,26 @@ fn next_issue(s: &mut Session, _: &Value) -> CmdResult {
     Ok(json!({"done": true}))
 }
 
+/// Ignore Once: skip the issue at the selection for the rest of the session.
+fn ignore_once(s: &mut Session, v: &Value) -> CmdResult {
+    /// Plenty for one sitting; keeps a script from growing the list without bound.
+    const MAX_IGNORED: usize = 10_000;
+    let at = v.get("pos").and_then(super::parse_pos).unwrap_or_else(|| s.sel.ordered().0);
+    let (a, b, _) = issue_at(s, &at).ok_or_else(|| CmdError::Params("no spelling or grammar issue there".into()))?;
+    let text = issue_text(s, &a, &b);
+    if !ignored_once(s, &a, &b) {
+        if s.proof_ignored.len() >= MAX_IGNORED {
+            s.proof_ignored.remove(0);
+        }
+        s.proof_ignored.push((a.story, a.path.clone(), a.off, b.off, text.clone()));
+    }
+    Ok(json!({"ignored": text}))
+}
+
 fn all_issues(s: &mut Session, _: &Value) -> CmdResult {
     let mut out = Vec::new();
     for path in s.doc.para_paths(StoryRef::Body) {
-        for (a, b, i) in para_issues(s, StoryRef::Body, &path) {
+        for (a, b, i) in open_issues(s, StoryRef::Body, &path) {
             out.push(issue_json(s, &a, &b, &i));
             if out.len() >= 500 {
                 return Ok(Value::Array(out));
