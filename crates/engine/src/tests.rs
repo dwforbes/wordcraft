@@ -1700,3 +1700,32 @@ fn one_issue_per_word_when_spelling_and_grammar_both_flag_it() {
     run(&mut s, "caret.docStart", json!({}));
     assert_eq!(spelling_walk(&mut s, 10), ["photocraft"]);
 }
+
+#[test]
+fn markdown_footnotes_and_front_matter_survive_docx() {
+    let src = "---\ntitle: Notes\npubDate: 2026-10-11\n---\n\nText[^footnote1] and[^2].\n\n[^footnote1]: This is the footnote.\n[^2]: Another.\n";
+    let doc = crate::io::open_bytes("post.md", src.as_bytes()).unwrap();
+    let docx = crate::io::save_bytes("post.docx", &doc).unwrap();
+    let back = crate::io::open_bytes("post.docx", &docx).unwrap();
+    assert_eq!(back.core.title, "Notes");
+    let md = String::from_utf8(crate::io::save_bytes("post.md", &back).unwrap()).unwrap();
+    assert_eq!(md, src);
+    // A footnote added in the editor gets the next free number.
+    let mut s = Session::new(back);
+    s.sel = crate::Selection::caret(s.doc.end_of(StoryRef::Body));
+    s.run("references.footnote", &json!({"text": "Added."})).unwrap();
+    let md = String::from_utf8(crate::io::save_bytes("post.mdx", &s.doc).unwrap()).unwrap();
+    assert!(md.contains("Text[^footnote1] and[^2].[^1]\n"), "{md}");
+    assert!(md.ends_with("[^2]: Another.\n[^1]: Added.\n"), "{md}");
+}
+
+#[test]
+fn mdx_source_isnt_spell_checked() {
+    let src = "import Calloot from './Calloot.astro';\n\n<Calloot tpye=\"info\" />\n\nWe recieve <Badgee txt=\"new\" /> mail.\n";
+    let mut s = Session::new(crate::io::open_bytes("post.mdx", src.as_bytes()).unwrap());
+    let issues = s.run("review.issues", &json!({})).unwrap().to_string();
+    assert!(issues.contains("recieve"), "the prose is still checked: {issues}");
+    for word in ["Calloot", "tpye", "Badgee", "txt"] {
+        assert!(!issues.contains(word), "{word} is source: {issues}");
+    }
+}

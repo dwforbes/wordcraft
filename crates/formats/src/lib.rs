@@ -19,7 +19,7 @@ pub mod txt;
 use wordcraft_doc::Document;
 
 /// Extensions this crate handles.
-pub const EXTENSIONS: &[&str] = &["txt", "text", "md", "markdown", "html", "htm", "xhtml", "rtf", "odt", "tex", "latex", "ltx"];
+pub const EXTENSIONS: &[&str] = &["txt", "text", "md", "markdown", "mdx", "html", "htm", "xhtml", "rtf", "odt", "tex", "latex", "ltx"];
 
 /// Import `bytes` in the format named by `ext` (no dot, any case). `None` = not our format.
 pub fn import(ext: &str, bytes: &[u8]) -> Option<Result<Document, String>> {
@@ -27,6 +27,7 @@ pub fn import(ext: &str, bytes: &[u8]) -> Option<Result<Document, String>> {
     let r = match ext.as_str() {
         "txt" | "text" => Ok(txt::import(bytes)),
         "md" | "markdown" => Ok(markdown::import(&txt::decode(bytes))),
+        "mdx" => Ok(markdown::import_mdx(&txt::decode(bytes))),
         "html" | "htm" | "xhtml" => Ok(html::import(&html::decode(bytes))),
         "rtf" => rtf::import(bytes),
         "odt" => odt::import(bytes),
@@ -45,6 +46,7 @@ pub fn export(ext: &str, doc: &Document) -> Option<Result<Vec<u8>, String>> {
     Some(match ext.as_str() {
         "txt" | "text" => Ok(txt::export(doc)),
         "md" | "markdown" => Ok(markdown::export(doc).into_bytes()),
+        "mdx" => Ok(markdown::export_mdx(doc).into_bytes()),
         "html" | "htm" | "xhtml" => Ok(html::export(doc).into_bytes()),
         "rtf" => Ok(rtf::export(doc).into_bytes()),
         "odt" => odt::export(doc),

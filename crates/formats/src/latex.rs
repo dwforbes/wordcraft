@@ -274,6 +274,8 @@ impl Writer {
                         o.push_str(&format!("${src}$"));
                     }
                 }
+                // Notes aren't written to LaTeX yet.
+                Inline::Note(_) => {}
             }
         }
         o

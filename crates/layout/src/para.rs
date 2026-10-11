@@ -1771,8 +1771,14 @@ pub fn paragraph_issues(doc: &Document, p: &Paragraph) -> Vec<wordcraft_proof::I
         return Vec::new();
     }
     let text = proof_text(p);
+    // "Do not check spelling or grammar" counts whether it's direct or from a style.
+    let style = p.props.style.as_deref();
     let skip = |a: usize, b: usize| {
-        p.run_ranges().any(|(r, c)| r.start < b && a < r.end && (c.no_proof == Some(true) || c.hidden == Some(true) || c.link.is_some()))
+        p.run_ranges().any(|(r, c)| {
+            r.start < b
+                && a < r.end
+                && (c.hidden == Some(true) || c.link.is_some() || c.no_proof == Some(true) || doc.styles.resolve_char(style, c).no_proof)
+        })
     };
     let ignored = doc.custom_prop(wordcraft_proof::IGNORED_WORDS_PROP).unwrap_or("");
     let mut v: Vec<wordcraft_proof::Issue> = wordcraft_proof::check_spelling(&text);

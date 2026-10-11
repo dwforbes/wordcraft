@@ -115,9 +115,12 @@ fn services() -> Services {
             let d = if purpose == "picture" {
                 d.add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
             } else {
-                d.add_filter("Documents", &["docx", "docm", "dotx", "dotm", "doc", "dot", "odt", "rtf", "txt", "md", "html", "htm", "tex", "json"])
-                    .add_filter("Word document", &["docx"])
-                    .add_filter("All files", &["*"])
+                d.add_filter(
+                    "Documents",
+                    &["docx", "docm", "dotx", "dotm", "doc", "dot", "odt", "rtf", "txt", "md", "markdown", "mdx", "html", "htm", "tex", "json"],
+                )
+                .add_filter("Word document", &["docx"])
+                .add_filter("All files", &["*"])
             };
             d.pick_file().map(|p| p.to_string_lossy().to_string())
         })),

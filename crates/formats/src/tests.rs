@@ -441,7 +441,7 @@ fn garbage_never_panics() {
                 seed as u8
             })
             .collect();
-        for ext in ["txt", "md", "html", "rtf", "odt", "tex"] {
+        for ext in ["txt", "md", "mdx", "html", "rtf", "odt", "tex"] {
             let _ = import(ext, &bytes);
         }
         let mut rtf = b"{\\rtf1".to_vec();
@@ -482,6 +482,17 @@ proptest::proptest! {
     }
 
     #[test]
+    fn fuzz_markdown_notes_and_mdx(s in "(\\[\\^[a-z]{0,3}\\]:?|---\n|\\+\\+\\+\n|    |<[A-Za-z/]{0,3}|[{}\"'>]|[ -~\n]){0,200}") {
+        for ext in ["md", "mdx"] {
+            let d = import(ext, s.as_bytes()).unwrap().unwrap();
+            let out = export(ext, &d).unwrap().unwrap();
+            let again = import(ext, &out).unwrap().unwrap();
+            // Writing what was read and reading it back settles: the same notes, same text.
+            proptest::prop_assert_eq!(again.parts.len(), d.parts.len(), "{}: {:?} -> {}", ext, s, String::from_utf8_lossy(&out));
+        }
+    }
+
+    #[test]
     fn fuzz_html(s in "(<(/)?(p|b|i|ul|ol|li|table|tr|td|th|pre|blockquote|a href=x|img src=data:,|br|h2|span style='color:red')>|[a-z &;#<>\"'=]){0,120}") {
         let d = import("html", s.as_bytes()).unwrap().unwrap();
         let _ = export("html", &d).unwrap().unwrap();
@@ -514,10 +525,22 @@ proptest::proptest! {
     fn markdown_text_round_trips(words in proptest::collection::vec("[a-zA-Z0-9*_`\\[\\]<>#.!-]{1,8}", 1..8)) {
         let text = words.join(" ");
         let d = Document::from_text(&text);
-        let md = export("md", &d).unwrap().unwrap();
-        let back = import("md", &md).unwrap().unwrap();
+        for ext in ["md", "mdx"] {
+            let md = export(ext, &d).unwrap().unwrap();
+            let back = import(ext, &md).unwrap().unwrap();
+            let got = back.plain_text(Default::default());
+            proptest::prop_assert_eq!(got.trim(), text.trim(), "{}: {}", ext, String::from_utf8_lossy(&md));
+        }
+    }
+
+    #[test]
+    fn mdx_text_round_trips(words in proptest::collection::vec("[a-zA-Z0-9{}<>/=\"'.!-]{1,8}", 1..8)) {
+        let text = words.join(" ");
+        let d = Document::from_text(&text);
+        let md = export("mdx", &d).unwrap().unwrap();
+        let back = import("mdx", &md).unwrap().unwrap();
         let got = back.plain_text(Default::default());
-        proptest::prop_assert_eq!(got.trim(), text.trim(), "md: {}", String::from_utf8_lossy(&md));
+        proptest::prop_assert_eq!(got.trim(), text.trim(), "mdx: {}", String::from_utf8_lossy(&md));
     }
 }
 
@@ -537,4 +560,211 @@ fn html_img_sources_go_through_the_loader() {
     assert!(text.contains("Missing") && !text.contains("Sample Logo"), "{text:?}");
     // Without a loader only data: URIs load.
     assert!(import("html", html.as_bytes()).unwrap().unwrap().media.is_empty());
+}
+
+// ---- Markdown footnotes, front matter and MDX ----
+
+fn md(ext: &str, src: &str) -> (Document, String) {
+    let d = import(ext, src.as_bytes()).unwrap().unwrap();
+    let out = String::from_utf8(export(ext, &d).unwrap().unwrap()).unwrap();
+    (d, out)
+}
+
+/// The body's footnotes in order: (label kept in the note, the note's paragraphs' text).
+fn notes(d: &Document) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for b in &d.body {
+        let Block::Para(p) = &**b else { continue };
+        for o in &p.objects {
+            if let InlineObject::NoteRef { kind, id, .. } = o {
+                assert_eq!(*kind, wordcraft_doc::para::NoteKind::Footnote);
+                let part = &d.parts[id];
+                assert_eq!(part.kind, wordcraft_doc::PartKind::Footnote);
+                let label = part
+                    .blocks
+                    .iter()
+                    .filter_map(|b| if let Block::Para(p) = &**b { Some(p) } else { None })
+                    .flat_map(|p| p.objects.iter())
+                    .find_map(|o| if let InlineObject::BookmarkStart { name } = o { model::note_label_of(name) } else { None })
+                    .unwrap_or_default();
+                let text: Vec<String> = part
+                    .blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if let Block::Para(p) = &**b { Some(p.plain_text().replace(wordcraft_doc::para::OBJ, "").trim().to_string()) } else { None }
+                    })
+                    .collect();
+                out.push((label, text.join("|")));
+            }
+        }
+    }
+    out
+}
+
+const POST: &str = "---
+title: \"Light, \\\"measured\\\"\"
+description: How meters see a scene
+tags: [photo, light]
+---
+
+# Metering
+
+This is some text[^footnote1] and more[^2].
+
+A second mention[^footnote1] and a table:
+
+| Mode | Note |
+| --- | --- |
+| Spot | narrow[^spot] |
+
+[^footnote1]: This is the footnote, with *emphasis* and a [link](https://example.com).
+[^2]: Second note.
+
+    Its second paragraph.
+
+[^spot]: About 1% of the frame.
+";
+
+#[test]
+fn markdown_footnotes_become_footnotes_and_round_trip() {
+    let (d, out) = md("md", POST);
+    assert_eq!(out, POST, "export of an import writes the same text");
+    let n = notes(&d);
+    assert_eq!(n.len(), 3, "{n:?}");
+    assert_eq!(n[0].0, "footnote1");
+    assert_eq!(n[0].1, "This is the footnote, with emphasis and a link.");
+    assert_eq!(n[1], ("2".to_string(), "Second note.|Its second paragraph.".to_string()));
+    assert_eq!(n[2].0, "footnote1", "the second mention is a second footnote with the same text");
+    // The note's mark is a Footnote Reference, the note in Footnote Text, like Insert Footnote.
+    let Block::Para(p) = &*d.parts[&1].blocks[0] else { panic!() };
+    assert_eq!(p.props.style.as_deref(), Some("FootnoteText"));
+    // Front matter: kept verbatim and read into the properties.
+    assert_eq!(d.core.title, "Light, \"measured\"");
+    assert_eq!(d.core.description, "How meters see a scene");
+    assert!(d.custom_prop(model::FRONT_MATTER_PROP).unwrap().contains("tags: [photo, light]"));
+    // The label in the table cell's note is kept too.
+    let Block::Table(t) = &*d.body[3] else { panic!("{:?}", d.body[3]) };
+    let Block::Para(cell) = &*t.rows[1].cells[1].blocks[0] else { panic!() };
+    assert!(cell.objects.iter().any(|o| matches!(o, InlineObject::NoteRef { .. })));
+}
+
+#[test]
+fn notes_without_labels_are_numbered_around_the_labels_in_use() {
+    let note = |label: &str, text: &str| {
+        let mut p = model::Para::default();
+        p.push_text(text, &model::Fmt::default());
+        model::Inline::Note(model::Note { label: label.into(), blocks: vec![FBlock::Para(p)] })
+    };
+    let mut p = model::Para::default();
+    p.push_text("One", &model::Fmt::default());
+    p.inlines.push(note("", "first"));
+    p.push_text(" two", &model::Fmt::default());
+    p.inlines.push(note("1", "labelled one"));
+    p.push_text(" three", &model::Fmt::default());
+    p.inlines.push(note("x", "an x"));
+    p.inlines.push(note("X", "another x"));
+    p.inlines.push(note("", "last"));
+    let d = model::to_doc(&model::Flow { blocks: vec![FBlock::Para(p)], meta: Default::default() });
+    let out = String::from_utf8(export("md", &d).unwrap().unwrap()).unwrap();
+    assert_eq!(out, "One[^2] two[^1] three[^x][^X-2][^3]\n\n[^2]: first\n[^1]: labelled one\n[^x]: an x\n[^X-2]: another x\n[^3]: last\n");
+}
+
+#[test]
+fn inserted_footnotes_export_as_numbered_notes() {
+    // A note made in the editor: its mark, a space and the text, in Footnote Text.
+    let mut d = Document::from_text("See this.");
+    let id = d.add_part(wordcraft_doc::PartKind::Footnote, Vec::new());
+    let mut note = Paragraph::new().styled("FootnoteText");
+    let mark = CharProps { style: Some("FootnoteReference".into()), ..Default::default() };
+    note.insert_object(0, InlineObject::NoteRef { kind: wordcraft_doc::para::NoteKind::Footnote, id, custom: String::new() }, &mark).unwrap();
+    let n = note.len();
+    note.insert_text(n, " The details.", &CharProps::default()).unwrap();
+    d.parts.get_mut(&id).unwrap().blocks = vec![para_block(note)];
+    let Block::Para(body) = &*d.body[0] else { panic!() };
+    let mut body = body.clone();
+    body.insert_object(8, InlineObject::NoteRef { kind: wordcraft_doc::para::NoteKind::Footnote, id, custom: String::new() }, &mark).unwrap();
+    d.body = vec![para_block(body)];
+    let out = String::from_utf8(export("md", &d).unwrap().unwrap()).unwrap();
+    assert_eq!(out, "See this[^1].\n\n[^1]: The details.\n");
+}
+
+#[test]
+fn unmatched_footnote_syntax_stays_text() {
+    let (d, out) = md("md", "No note[^missing] here.\n\n[^lonely]: Nobody cites me.\n\n`[^code]` and [^a b].\n\n```\n[^fenced]: not a note\n```\n");
+    assert!(notes(&d).is_empty());
+    let text = d.plain_text(Default::default());
+    assert!(text.contains("No note[^missing] here."), "{text}");
+    assert!(text.contains("[^lonely]: Nobody cites me."), "an unused definition isn't lost: {text}");
+    assert!(text.contains("[^fenced]: not a note"));
+    let back = import("md", out.as_bytes()).unwrap().unwrap();
+    assert_eq!(back.plain_text(Default::default()), text, "{out}");
+}
+
+#[test]
+fn notes_dont_nest_and_definitions_can_come_first() {
+    let (d, out) = md("md", "[^a]: Note a cites[^b].\n[^b]: Note b.\n\nText[^a] and[^b].\n");
+    let n = notes(&d);
+    assert_eq!(n.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert!(n[0].1.ends_with("Note a cites[^b]."), "{n:?}");
+    assert_eq!(out, "Text[^a] and[^b].\n\n[^a]: Note a cites\\[^b\\].\n[^b]: Note b.\n");
+}
+
+#[test]
+fn front_matter_follows_the_document_properties() {
+    let src = "---\ntitle: Old title\ndescription: 'It''s short'\nauthor: \"A\"\ndraft: true\n---\n\nBody\n";
+    let mut d = import("md", src.as_bytes()).unwrap().unwrap();
+    assert_eq!((d.core.title.as_str(), d.core.description.as_str(), d.core.creator.as_str()), ("Old title", "It's short", "A"));
+    d.core.title = "New: a \"title\"".into();
+    d.core.description = "Isn't long".into();
+    d.core.creator = "Ben".into();
+    let out = String::from_utf8(export("md", &d).unwrap().unwrap()).unwrap();
+    assert_eq!(out, "---\ntitle: \"New: a \\\"title\\\"\"\ndescription: 'Isn''t long'\nauthor: \"Ben\"\ndraft: true\n---\n\nBody\n");
+    // TOML front matter, and a block without an end, which is just text.
+    let (d, out) = md("md", "+++\ntitle = \"T\"\n+++\n\nBody\n");
+    assert_eq!(d.core.title, "T");
+    assert_eq!(out, "+++\ntitle = \"T\"\n+++\n\nBody\n");
+    let (d, _) = md("md", "---\ntitle: x\n\nno end");
+    assert!(d.custom_prop(model::FRONT_MATTER_PROP).is_none());
+    assert_eq!(d.core.title, "");
+}
+
+const MDX: &str = "---
+title: Components
+---
+
+import Callout from '../components/Callout.astro';
+export const year = 2026;
+
+# Using {year}
+
+<Callout type=\"info\" title=\"Heads up\">
+
+Some **bold** text with <Badge text=\"new\" /> and {props.count} items[^n].
+
+</Callout>
+
+{/* a comment */}
+
+Literal braces \\{like this\\} and a less-than \\< sign.
+
+[^n]: Counted at build time.
+";
+
+#[test]
+fn mdx_keeps_imports_jsx_and_expressions() {
+    let (d, out) = md("mdx", MDX);
+    assert_eq!(out, MDX);
+    let b = flat(&d);
+    let kinds: Vec<_> = b.iter().filter_map(|b| if let FBlock::Para(p) = b { Some((p.kind, p.text())) } else { None }).collect();
+    assert_eq!(kinds[0], (Kind::Raw, "import Callout from '../components/Callout.astro';\nexport const year = 2026;".into()));
+    let FBlock::Para(h) = &b[1] else { panic!() };
+    assert_eq!(h.kind, Kind::Heading(1));
+    assert!(h.inlines.iter().any(|i| matches!(i, model::Inline::Text(t, f) if t == "{year}" && f.raw)));
+    assert_eq!(kinds[2], (Kind::Raw, "<Callout type=\"info\" title=\"Heads up\">".into()));
+    assert_eq!(notes(&d).len(), 1);
+    // In the document, raw source has its own styles.
+    assert!(d.styles.get(model::RAW_STYLE).is_some() && d.styles.get(model::RAW_CHAR_STYLE).is_some());
+    // As plain Markdown, the same document escapes nothing it shouldn't and keeps the source.
+    let as_md = String::from_utf8(export("md", &d).unwrap().unwrap()).unwrap();
+    assert!(as_md.contains("<Badge text=\"new\" />") && as_md.contains("Literal braces {like this}"), "{as_md}");
 }

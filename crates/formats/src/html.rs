@@ -1237,7 +1237,8 @@ pub fn inlines_html(inlines: &[Inline]) -> String {
                 ));
             }
             Inline::Anchor(a) => o.push_str(&format!("<a id=\"{}\"></a>", esc(a))),
-            Inline::Equation { .. } => {}
+            // Notes aren't written to HTML yet.
+            Inline::Equation { .. } | Inline::Note(_) => {}
         }
     }
     o

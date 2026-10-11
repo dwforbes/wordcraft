@@ -400,6 +400,7 @@
 	Mark\nCitation	标记引文
 	Mark\nEntry	标记条目
 	Markdown (*.md)	Markdown (*.md)
+	MDX (*.mdx)	MDX (*.mdx)
 	Match case	区分大小写
 	Match Fields	匹配域
 	Matrix	矩阵

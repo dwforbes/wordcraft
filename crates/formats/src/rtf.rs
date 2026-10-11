@@ -187,7 +187,8 @@ impl Writer {
                     let a = esc(a);
                     out.push_str(&format!("{{\\*\\bkmkstart {a}}}{{\\*\\bkmkend {a}}}"));
                 }
-                Inline::Equation { .. } => {}
+                // Notes aren't written to RTF yet.
+                Inline::Equation { .. } | Inline::Note(_) => {}
             }
         }
     }
@@ -214,7 +215,7 @@ impl Writer {
         }
         match p.kind {
             Kind::Quote => out.push_str("\\li720\\ri720\\i"),
-            Kind::Code => {
+            Kind::Code | Kind::Raw => {
                 let f = self.t.font(model::MONO_FONT);
                 out.push_str(&format!("\\sa0\\f{f}\\fs20"));
             }

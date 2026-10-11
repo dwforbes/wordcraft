@@ -61,7 +61,7 @@ the icon art).
 | Pictures & shapes (insert, size, crop, recolour, effects, styles, float position) | Text wraps around floats (rectangular); text boxes render and edit their text; select, drag to move, resize handles, arrow nudge on the canvas; no tight/contour wrap, no rotation handles | 60% |
 | Draw tab (ink), SmartArt, charts, 3D models, equations editor | Equations: full OMML read/write, 2D layout (OpenType MATH) and in-place editing with an Equation tab; long display equations don't break across lines yet. Ink, SmartArt, charts, 3D not started | 20% |
 | File formats: DOCX read/write | Good (Word opens our files); charts/SmartArt/OLE dropped; untested on a real-world corpus | 75% |
-| File formats: PDF, ODT, RTF, HTML, Markdown, LaTeX, TXT | Working | 70% |
+| File formats: PDF, ODT, RTF, HTML, Markdown/MDX, LaTeX, TXT | Working. Markdown: GFM footnotes (`[^label]`) become real footnotes and keep their labels; front matter is kept, and its title, description and author become document properties; MDX keeps `import`/`export` lines, JSX and `{expressions}` verbatim. Footnotes are dropped by the HTML, ODT, RTF and LaTeX exporters | 70% |
 | File formats: Word 97-2003 `.doc`/`.dot` import | Text, formatting, styles, sections, headers/footers, tables, lists, notes, fields, bookmarks, pictures (spec-based reader; metafile images and Word 6/95 rejected) | 60% |
 | View modes (print, web, draft, read, focus, zoom, navigation pane) | Working | 70% |
 | Backstage (new from templates, open, info, export, options) | Working; printing goes through PDF | 55% |

@@ -250,6 +250,7 @@ fn export_page(app: &mut WordApp, ui: &mut Ui) {
         ("Rich Text Format (*.rtf)", "rtf"),
         ("Web page (*.html)", "html"),
         ("Markdown (*.md)", "md"),
+        ("MDX (*.mdx)", "mdx"),
         ("LaTeX (*.tex)", "tex"),
         ("Plain text (*.txt)", "txt"),
         ("Page image (*.png)", "png"),

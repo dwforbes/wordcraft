@@ -13,6 +13,7 @@ pub const OPEN_EXTS: &[&str] = &[
     "txt",
     "md",
     "markdown",
+    "mdx",
     "html",
     "htm",
     "rtf",
@@ -24,7 +25,7 @@ pub const OPEN_EXTS: &[&str] = &[
     "json",
 ];
 /// Formats WordCraft saves (Save As).
-pub const SAVE_EXTS: &[&str] = &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "html", "rtf", "odt", "tex", "png", "json"];
+pub const SAVE_EXTS: &[&str] = &["docx", "docm", "dotx", "dotm", "pdf", "txt", "md", "mdx", "html", "rtf", "odt", "tex", "png", "json"];
 
 fn ext_of(name: &str) -> String {
     let lower = name.to_ascii_lowercase();

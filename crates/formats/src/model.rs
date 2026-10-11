@@ -5,18 +5,24 @@
 use std::sync::Arc;
 
 use wordcraft_doc::numbering::{AbstractNum, Level, ListKind, Num, levels_for};
-use wordcraft_doc::para::{InlineObject, OBJ, PAGE_BREAK};
+use wordcraft_doc::para::{InlineObject, NoteKind, OBJ, PAGE_BREAK};
 use wordcraft_doc::props::{
     Border, BorderStyle, Borders, CellProps, CharProps, NumRef, ParaProps, RowProps, TextColor, Underline, VMerge, VertAlign,
 };
 use wordcraft_doc::section::NumFormat;
 use wordcraft_doc::styles::{Style, StyleKind};
-use wordcraft_doc::{Align, Block, Blocks, Document, Paragraph, Rgb, Table, para_block};
+use wordcraft_doc::{Align, Block, Blocks, Document, Paragraph, PartKind, Rgb, Table, para_block};
 
 /// Font used for code spans and code blocks.
 pub const MONO_FONT: &str = "Courier New";
 /// Style id of code-block paragraphs.
 pub const CODE_STYLE: &str = "Code";
+/// Paragraph style of [`Kind::Raw`] lines.
+pub const RAW_STYLE: &str = "MarkdownSource";
+/// Character style of [`Fmt::raw`] text.
+pub const RAW_CHAR_STYLE: &str = "MarkdownSourceChar";
+/// Colour of raw source, so it stands out from the prose.
+const RAW_COLOR: Rgb = Rgb(0x2E, 0x6E, 0x8E);
 /// Nesting limit for tables in tables (hostile input).
 pub const MAX_DEPTH: usize = 8;
 
@@ -37,6 +43,8 @@ pub struct Fmt {
     pub font: Option<String>,
     /// Background (highlight / shading).
     pub background: Option<Rgb>,
+    /// Source written out verbatim (inline JSX and `{expressions}` in MDX).
+    pub raw: bool,
 }
 
 /// An embedded picture.
@@ -63,6 +71,63 @@ pub enum Inline {
         linear: String,
         display: bool,
     },
+    /// A footnote: the reference mark here, the note's content in `blocks`. Formats without
+    /// notes leave it out.
+    Note(Note),
+}
+
+/// A footnote's content and the label it had in the source (Markdown `[^label]`), if any.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Note {
+    pub label: String,
+    pub blocks: Vec<FBlock>,
+}
+
+/// Bookmark-name prefix that keeps a note's source label inside the note (hidden, like Word's
+/// `_Ref` bookmarks, so it survives .docx).
+pub const NOTE_LABEL_PREFIX: &str = "_Md";
+
+/// Word's bookmark-name limit.
+const MAX_BOOKMARK: usize = 40;
+
+/// The hidden bookmark name that stores `label` (the `n`th note with it counts from 1), or
+/// `None` if the label can't be kept in one: letters and digits stay, other ASCII becomes `_hh`.
+pub fn note_label_bookmark(label: &str, n: usize) -> Option<String> {
+    let mut s = NOTE_LABEL_PREFIX.to_string();
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if c.is_ascii() && !c.is_ascii_control() && c != ' ' {
+            s.push_str(&format!("_{:02x}", c as u32));
+        } else {
+            return None;
+        }
+    }
+    if n > 1 {
+        s.push_str(&format!("_x{n}"));
+    }
+    (!label.is_empty() && s.len() <= MAX_BOOKMARK).then_some(s)
+}
+
+/// The label stored by [`note_label_bookmark`].
+pub fn note_label_of(bookmark: &str) -> Option<String> {
+    let rest = bookmark.strip_prefix(NOTE_LABEL_PREFIX)?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c != '_' {
+            out.push(c);
+            continue;
+        }
+        let a = chars.next()?;
+        if a == 'x' {
+            break;
+        }
+        let b = chars.next()?;
+        let v = u32::from_str_radix(&format!("{a}{b}"), 16).ok()?;
+        out.push(char::from_u32(v).filter(char::is_ascii)?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,6 +142,9 @@ pub enum Kind {
     Code,
     /// A horizontal rule (empty paragraph with a bottom border).
     Rule,
+    /// A block of source written out verbatim, lines separated by `\n` (MDX `import`s, JSX
+    /// blocks, `{expressions}`).
+    Raw,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,13 +180,13 @@ impl Para {
         }
         self.inlines.push(Inline::Text(s.to_string(), f.clone()));
     }
-    /// The plain text (images and anchors left out; equations as their linear text).
+    /// The plain text (images, anchors and notes left out; equations as their linear text).
     pub fn text(&self) -> String {
         let mut s = String::new();
         for i in &self.inlines {
             match i {
                 Inline::Text(t, _) | Inline::Equation { linear: t, .. } => s.push_str(t),
-                Inline::Image(_) | Inline::Anchor(_) => {}
+                Inline::Image(_) | Inline::Anchor(_) | Inline::Note(_) => {}
             }
         }
         s
@@ -245,7 +313,12 @@ pub struct Meta {
     pub keywords: String,
     pub description: String,
     pub created: String,
+    /// Front matter kept verbatim, delimiters included (Markdown's `---` YAML block).
+    pub front_matter: String,
 }
+
+/// Custom document property holding [`Meta::front_matter`], so it survives editing and .docx.
+pub const FRONT_MATTER_PROP: &str = "WordCraftFrontMatter";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Flow {
@@ -297,8 +370,27 @@ pub fn char_props(f: &Fmt) -> CharProps {
         size: f.size.filter(|s| s.is_finite() && *s >= 1.0 && *s <= 1638.0),
         font: if f.code { Some(MONO_FONT.to_string()) } else { f.font.clone().filter(|s| !s.is_empty()) },
         shading: f.background,
+        style: f.raw.then(|| RAW_CHAR_STYLE.to_string()),
         ..Default::default()
     }
+}
+
+fn raw_styles() -> [Style; 2] {
+    // Source isn't prose: spelling and grammar leave it alone.
+    let chr = CharProps { font: Some(MONO_FONT.into()), color: Some(TextColor::Rgb(RAW_COLOR)), no_proof: Some(true), ..Default::default() };
+    [
+        Style {
+            id: RAW_STYLE.into(),
+            name: "Markdown Source".into(),
+            kind: StyleKind::Paragraph,
+            based_on: Some("Normal".into()),
+            para: ParaProps { space_after: Some(0.0), space_before: Some(0.0), line_spacing: Some(Default::default()), ..Default::default() },
+            chr: CharProps { size: Some(10.0), ..chr.clone() },
+            quick: false,
+            ..Default::default()
+        },
+        Style { id: RAW_CHAR_STYLE.into(), name: "Markdown Source Char".into(), kind: StyleKind::Character, chr, quick: false, ..Default::default() },
+    ]
 }
 
 fn code_style() -> Style {
@@ -320,6 +412,10 @@ fn rule_borders() -> Borders {
 
 struct Builder<'a> {
     doc: &'a mut Document,
+    /// Building a note's content (notes don't nest).
+    in_note: bool,
+    /// Notes so far per label, for unique label bookmarks.
+    labels: std::collections::HashMap<String, usize>,
 }
 
 impl Builder<'_> {
@@ -330,6 +426,7 @@ impl Builder<'_> {
             Kind::Title => Some("Title".into()),
             Kind::Quote => Some("Quote".into()),
             Kind::Code => Some(CODE_STYLE.into()),
+            Kind::Raw => Some(RAW_STYLE.into()),
             Kind::Rule | Kind::Normal => None,
         };
         out.props.style = style;
@@ -352,7 +449,7 @@ impl Builder<'_> {
                 Inline::Text(t, f) => {
                     let t = clean_text(t);
                     let mut cp = char_props(f);
-                    if p.kind == Kind::Code && cp.font.as_deref() == Some(MONO_FONT) {
+                    if matches!(p.kind, Kind::Code | Kind::Raw) && cp.font.as_deref() == Some(MONO_FONT) {
                         cp.font = None;
                     }
                     let _ = out.insert_text(end, &t, &cp);
@@ -378,9 +475,57 @@ impl Builder<'_> {
                         );
                     }
                 }
+                Inline::Note(n) if !self.in_note => {
+                    let id = self.note(n);
+                    let _ = out.insert_object(end, InlineObject::NoteRef { kind: NoteKind::Footnote, id, custom: String::new() }, &note_ref_props());
+                }
+                Inline::Note(_) => {}
             }
         }
         out
+    }
+
+    /// A footnote part for `n`, laid out like Insert Footnote's: its mark and a space start the
+    /// first paragraph, all in Footnote Text.
+    fn note(&mut self, n: &Note) -> u32 {
+        self.in_note = true;
+        let built = self.blocks(&n.blocks, 1);
+        self.in_note = false;
+        let mut blocks = Blocks::new();
+        for b in built {
+            match &*b {
+                Block::Para(p) if p.props.style.is_none() => {
+                    let mut p = p.clone();
+                    p.props.style = Some("FootnoteText".into());
+                    blocks.push(para_block(p));
+                }
+                _ => blocks.push(b),
+            }
+        }
+        let mut first = match blocks.first().map(|b| &**b) {
+            Some(Block::Para(p)) => {
+                let p = p.clone();
+                blocks.remove(0);
+                p
+            }
+            _ => Paragraph::new().styled("FootnoteText"),
+        };
+        let id = self.doc.add_part(PartKind::Footnote, Vec::new());
+        let _ = first.insert_object(0, InlineObject::NoteRef { kind: NoteKind::Footnote, id, custom: String::new() }, &note_ref_props());
+        let at = OBJ.len_utf8();
+        let _ = first.insert_text(at, " ", &CharProps::default());
+        let at = at + 1;
+        let count = self.labels.entry(n.label.to_lowercase()).or_insert(0);
+        *count += 1;
+        if let Some(name) = note_label_bookmark(&n.label, *count) {
+            let _ = first.insert_object(at, InlineObject::BookmarkStart { name: name.clone() }, &CharProps::default());
+            let _ = first.insert_object(at + OBJ.len_utf8(), InlineObject::BookmarkEnd { name }, &CharProps::default());
+        }
+        blocks.insert(0, para_block(first));
+        if let Some(part) = self.doc.parts.get_mut(&id) {
+            part.blocks = blocks;
+        }
+        id
     }
 
     /// A new list instance whose levels follow the kinds used in `group` (first use per level).
@@ -511,6 +656,10 @@ impl Builder<'_> {
     }
 }
 
+fn note_ref_props() -> CharProps {
+    CharProps { style: Some("FootnoteReference".into()), ..Default::default() }
+}
+
 fn finite_or(v: f32, d: f32) -> f32 {
     if v.is_finite() { v } else { d }
 }
@@ -523,7 +672,12 @@ pub fn to_doc(flow: &Flow) -> Document {
     if uses_code {
         doc.styles.upsert(code_style());
     }
-    let body = Builder { doc: &mut doc }.blocks(&flow.blocks, 0);
+    if uses_kind(&flow.blocks, Kind::Raw, 0) || uses_raw_text(&flow.blocks, 0) {
+        for st in raw_styles() {
+            doc.styles.upsert(st);
+        }
+    }
+    let body = Builder { doc: &mut doc, in_note: false, labels: Default::default() }.blocks(&flow.blocks, 0);
     doc.body = body;
     let m = &flow.meta;
     doc.core.title = m.title.clone();
@@ -532,14 +686,29 @@ pub fn to_doc(flow: &Flow) -> Document {
     doc.core.keywords = m.keywords.clone();
     doc.core.description = m.description.clone();
     doc.core.created = m.created.clone();
+    if !m.front_matter.is_empty() {
+        doc.set_custom_prop(FRONT_MATTER_PROP, &m.front_matter);
+    }
     doc.ensure_nonempty();
     doc
+}
+
+fn uses_raw_text(blocks: &[FBlock], depth: usize) -> bool {
+    depth <= MAX_DEPTH
+        && blocks.iter().any(|b| match b {
+            FBlock::Para(p) => p.inlines.iter().any(|i| match i {
+                Inline::Text(_, f) => f.raw,
+                Inline::Note(n) => uses_raw_text(&n.blocks, depth + 1),
+                _ => false,
+            }),
+            FBlock::Table(t) => t.rows.iter().flatten().any(|c| uses_raw_text(&c.blocks, depth + 1)),
+        })
 }
 
 fn uses_kind(blocks: &[FBlock], k: Kind, depth: usize) -> bool {
     depth <= MAX_DEPTH
         && blocks.iter().any(|b| match b {
-            FBlock::Para(p) => p.kind == k,
+            FBlock::Para(p) => p.kind == k || p.inlines.iter().any(|i| matches!(i, Inline::Note(n) if uses_kind(&n.blocks, k, depth + 1))),
             FBlock::Table(t) => t.rows.iter().flatten().any(|c| uses_kind(&c.blocks, k, depth + 1)),
         })
 }
@@ -580,7 +749,8 @@ fn effective(doc: &Document, cp: &CharProps) -> CharProps {
 
 fn fmt_of(doc: &Document, cp: &CharProps, in_code: bool) -> Fmt {
     let e = effective(doc, cp);
-    let code = !in_code && e.font.as_deref().is_some_and(is_mono);
+    let raw = !in_code && cp.style.as_deref().is_some_and(|s| doc.styles.chain(s).iter().any(|x| x.id == RAW_CHAR_STYLE));
+    let code = !in_code && !raw && e.font.as_deref().is_some_and(is_mono);
     Fmt {
         bold: e.bold.unwrap_or(false),
         italic: e.italic.unwrap_or(false),
@@ -591,12 +761,13 @@ fn fmt_of(doc: &Document, cp: &CharProps, in_code: bool) -> Fmt {
         sub: e.vert_align == Some(VertAlign::Subscript),
         link: e.link.clone(),
         color: match e.color {
-            Some(TextColor::Rgb(c)) => Some(c),
+            Some(TextColor::Rgb(c)) if !raw => Some(c),
             _ => None,
         },
         size: e.size,
-        font: if code || in_code { None } else { e.font.clone() },
+        font: if code || in_code || raw { None } else { e.font.clone() },
         background: e.highlight.and_then(|h| h.rgb()).or(e.shading),
+        raw,
     }
 }
 
@@ -610,6 +781,8 @@ pub fn para_kind(doc: &Document, p: &Paragraph) -> (Kind, Option<ListInfo>) {
         Kind::Title
     } else if doc.styles.chain(style).iter().any(|s| s.id == "Quote" || s.id == "IntenseQuote") {
         Kind::Quote
+    } else if doc.styles.chain(style).iter().any(|s| s.id == RAW_STYLE) {
+        Kind::Raw
     } else if is_code_style(doc, style) {
         Kind::Code
     } else if p.plain_text().trim().is_empty()
@@ -641,6 +814,11 @@ fn media_ext(key: &str, data: &[u8]) -> String {
 /// A document paragraph as flow paragraphs: a page break character inside the text ends the
 /// paragraph, and the text after it starts a new one that carries `page_break`.
 pub fn flow_paras(doc: &Document, p: &Paragraph) -> Vec<Para> {
+    flow_paras_in(doc, p, false)
+}
+
+/// [`flow_paras`]; `in_note` for a note's own paragraphs (its reference mark is left out).
+fn flow_paras_in(doc: &Document, p: &Paragraph, in_note: bool) -> Vec<Para> {
     let (kind, list) = para_kind(doc, p);
     let mut done: Vec<Para> = Vec::new();
     let mut out = Para { kind, list, align: p.props.align, page_break: p.props.page_break_before.unwrap_or(false), inlines: Vec::new() };
@@ -697,6 +875,15 @@ pub fn flow_paras(doc: &Document, p: &Paragraph) -> Vec<Para> {
                     let linear = if linear.is_empty() { wordcraft_doc::math::to_linear(&math.nodes) } else { linear.clone() };
                     out.inlines.push(Inline::Equation { linear, display: *display });
                 }
+                Some(InlineObject::NoteRef { id, .. }) => {
+                    if !buf.is_empty() {
+                        out.push_text(&std::mem::take(&mut buf), &f);
+                    }
+                    if !in_note && let Some(n) = note_of(doc, *id) {
+                        out.inlines.push(Inline::Note(n));
+                    }
+                }
+                Some(InlineObject::BookmarkStart { name }) if name.starts_with(NOTE_LABEL_PREFIX) => {}
                 Some(InlineObject::BookmarkStart { name }) if name != "_GoBack" => {
                     if !buf.is_empty() {
                         out.push_text(&std::mem::take(&mut buf), &f);
@@ -715,16 +902,39 @@ pub fn flow_paras(doc: &Document, p: &Paragraph) -> Vec<Para> {
     done
 }
 
-fn flow_blocks(doc: &Document, bl: &Blocks, depth: usize) -> Vec<FBlock> {
+/// Note `id`'s content, without its mark and the space after it, and its source label.
+fn note_of(doc: &Document, id: u32) -> Option<Note> {
+    let part = doc.parts.get(&id)?;
+    let mut blocks = flow_blocks(doc, &part.blocks, 1, true);
+    if let Some(FBlock::Para(p)) = blocks.first_mut()
+        && let Some(Inline::Text(t, _)) = p.inlines.first_mut()
+    {
+        let trimmed = t.trim_start_matches([' ', '\t']).len();
+        t.replace_range(..t.len() - trimmed, "");
+        if t.is_empty() {
+            p.inlines.remove(0);
+        }
+    }
+    let label = part
+        .blocks
+        .iter()
+        .filter_map(|b| if let Block::Para(p) = &**b { Some(p) } else { None })
+        .flat_map(|p| p.objects.iter())
+        .find_map(|o| if let InlineObject::BookmarkStart { name } = o { note_label_of(name) } else { None })
+        .unwrap_or_default();
+    Some(Note { label, blocks })
+}
+
+fn flow_blocks(doc: &Document, bl: &Blocks, depth: usize, in_note: bool) -> Vec<FBlock> {
     let mut out = Vec::new();
     for b in bl {
         match &**b {
-            Block::Para(p) => out.extend(flow_paras(doc, p).into_iter().map(FBlock::Para)),
-            Block::Table(t) if depth < MAX_DEPTH => out.push(FBlock::Table(flow_table(doc, t, depth))),
+            Block::Para(p) => out.extend(flow_paras_in(doc, p, in_note).into_iter().map(FBlock::Para)),
+            Block::Table(t) if depth < MAX_DEPTH => out.push(FBlock::Table(flow_table(doc, t, depth, in_note))),
             Block::Table(t) => {
                 for r in &t.rows {
                     for c in &r.cells {
-                        out.extend(flow_blocks(doc, &c.blocks, depth));
+                        out.extend(flow_blocks(doc, &c.blocks, depth, in_note));
                     }
                 }
             }
@@ -733,7 +943,7 @@ fn flow_blocks(doc: &Document, bl: &Blocks, depth: usize) -> Vec<FBlock> {
     out
 }
 
-fn flow_table(doc: &Document, t: &Table, depth: usize) -> FTable {
+fn flow_table(doc: &Document, t: &Table, depth: usize, in_note: bool) -> FTable {
     let mut rows = Vec::new();
     for (ri, r) in t.rows.iter().enumerate() {
         let header = r.props.header || (ri == 0 && t.props.look.header_row && t.rows.len() > 1);
@@ -751,7 +961,7 @@ fn flow_table(doc: &Document, t: &Table, depth: usize) -> FTable {
                 }
             }
             cells.push(Cell {
-                blocks: flow_blocks(doc, &c.blocks, depth + 1),
+                blocks: flow_blocks(doc, &c.blocks, depth + 1, in_note),
                 colspan: c.span() as u32,
                 rowspan,
                 covered: c.props.vmerge == VMerge::Continue,
@@ -768,7 +978,7 @@ fn flow_table(doc: &Document, t: &Table, depth: usize) -> FTable {
 pub fn from_doc(doc: &Document) -> Flow {
     let c = &doc.core;
     Flow {
-        blocks: flow_blocks(doc, &doc.body, 0),
+        blocks: flow_blocks(doc, &doc.body, 0, false),
         meta: Meta {
             title: c.title.clone(),
             author: c.creator.clone(),
@@ -776,6 +986,7 @@ pub fn from_doc(doc: &Document) -> Flow {
             keywords: c.keywords.clone(),
             description: c.description.clone(),
             created: c.created.clone(),
+            front_matter: doc.custom_prop(FRONT_MATTER_PROP).unwrap_or_default().to_string(),
         },
     }
 }

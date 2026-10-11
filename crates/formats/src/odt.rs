@@ -123,7 +123,7 @@ fn parent_style(k: Kind) -> &'static str {
         Kind::Heading(_) => "Heading_20_6",
         Kind::Title => "Title",
         Kind::Quote => "Quotations",
-        Kind::Code => "Preformatted_20_Text",
+        Kind::Code | Kind::Raw => "Preformatted_20_Text",
         Kind::Normal | Kind::Rule => "Standard",
     }
 }
@@ -247,7 +247,8 @@ impl Writer {
                     prev_space = false;
                 }
                 Inline::Anchor(a) => out.push_str(&format!("<text:bookmark text:name=\"{}\"/>", x(a))),
-                Inline::Equation { .. } => {}
+                // Notes aren't written to ODT yet.
+                Inline::Equation { .. } | Inline::Note(_) => {}
             }
         }
     }

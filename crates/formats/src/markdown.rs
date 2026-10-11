@@ -1,21 +1,47 @@
-//! Markdown: a CommonMark subset plus GitHub tables and strikethrough.
+//! Markdown: a CommonMark subset plus GitHub tables, strikethrough and footnotes, front matter,
+//! and MDX.
 //!
 //! Import: ATX and setext headings, paragraphs with soft/hard breaks, block quotes (→ Quote
 //! style), fenced and indented code (→ one Code paragraph per line), thematic breaks (→ a
 //! bottom-border paragraph), bullet and ordered lists (nested by indentation), GFM pipe tables,
 //! and inlines: emphasis/strong (the CommonMark delimiter algorithm), `~~strike~~`, code spans,
 //! inline links, autolinks, images (`data:` URIs become pictures, others their alt text),
-//! backslash escapes, entities, `<br>` and `<a id>` anchors.
+//! backslash escapes, entities, `<br>` and `<a id>` anchors. GFM footnotes (`text[^label]` and
+//! `[^label]: note`, continued by indented lines) become footnotes that remember their label.
+//! A leading `---` YAML (or `+++` TOML) front matter block is kept verbatim; its `title`,
+//! `description` and `author` fill the document properties.
 //!
-//! Export writes the same constructs; pictures become `![alt](media-name)` placeholders.
+//! MDX ([`parse_mdx`], [`export_mdx`]) keeps `import`/`export` lines, JSX tags and
+//! `{expressions}` verbatim: whole blocks as [`Kind::Raw`] lines, inline ones as raw text.
+//!
+//! Export writes the same constructs; pictures become `![alt](media-name)` placeholders. Notes are
+//! written as `[^label]` with their definitions at the end; notes without a label are numbered.
+
+use std::collections::HashSet;
 
 use wordcraft_doc::{Align, Document};
 
 use crate::html::decode_entity;
-use crate::model::{self, Cell, FBlock, FTable, Fmt, Inline, Kind, ListInfo, Para, make_img};
+use crate::model::{self, Cell, FBlock, FTable, Fmt, Inline, Kind, ListInfo, Meta, Note, Para, make_img};
 
 /// Nesting limit for block containers (quotes, list items) and inline links.
 const MAX_NEST: usize = 32;
+
+/// Longest footnote label (CommonMark's link label limit).
+const MAX_LABEL: usize = 999;
+
+/// Longest front matter block kept.
+const MAX_FRONT_MATTER: usize = 256 * 1024;
+
+/// Parser state shared by the block and inline passes.
+#[derive(Default)]
+struct Cx {
+    mdx: bool,
+    /// Normalized labels that have a `[^label]:` line somewhere (references to others stay text).
+    labels: HashSet<String>,
+    /// Footnote definitions in document order: (normalized label, label, content).
+    defs: Vec<(String, String, Vec<FBlock>)>,
+}
 
 // ---------------------------------------------------------------------------------------------
 // Import
@@ -25,16 +51,206 @@ pub fn import(text: &str) -> Document {
     model::to_doc(&parse(text))
 }
 
+/// Parse MDX text into a document.
+pub fn import_mdx(text: &str) -> Document {
+    model::to_doc(&parse_mdx(text))
+}
+
 /// Parse Markdown text into the flow model.
 pub fn parse(text: &str) -> model::Flow {
+    parse_with(text, false)
+}
+
+/// Parse MDX text into the flow model.
+pub fn parse_mdx(text: &str) -> model::Flow {
+    parse_with(text, true)
+}
+
+fn parse_with(text: &str, mdx: bool) -> model::Flow {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    let lines: Vec<String> = text.split('\n').map(|l| expand_tabs(l.trim_end_matches('\r'))).collect();
-    let mut blocks = parse_blocks(&lines, 0, 0);
-    // A leading "Title" from front matter isn't supported; a first-level heading stays a heading.
+    let mut lines: Vec<String> = text.split('\n').map(|l| expand_tabs(l.trim_end_matches('\r'))).collect();
+    let mut meta = Meta::default();
+    if let Some(n) = front_matter_lines(&lines) {
+        meta.front_matter = lines.drain(..n).collect::<Vec<_>>().join("\n");
+        for (key, slot) in [("title", &mut meta.title), ("description", &mut meta.description), ("author", &mut meta.author)] {
+            if let Some(v) = front_matter_value(&meta.front_matter, key) {
+                *slot = v;
+            }
+        }
+    }
+    let mut cx = Cx { mdx, ..Default::default() };
+    for l in &lines {
+        if let Some((label, _)) = note_def_start(l.trim_start_matches([' ', '>'])) {
+            cx.labels.insert(norm_label(label));
+        }
+    }
+    let mut blocks = parse_blocks(&lines, 0, 0, &mut cx);
+    resolve_notes(&mut blocks, &cx.defs, false, 0);
+    // A definition nothing refers to is kept as text rather than lost.
+    let used: HashSet<String> = used_labels(&blocks);
+    for (key, label, content) in &cx.defs {
+        if used.contains(key) {
+            continue;
+        }
+        let mut content = content.clone();
+        resolve_notes(&mut content, &cx.defs, true, 0);
+        let mut head = Para::default();
+        head.push_text(&format!("[^{label}]: "), &Fmt::default());
+        match content.first_mut() {
+            Some(FBlock::Para(p)) if p.kind == Kind::Normal && p.list.is_none() => {
+                head.inlines.append(&mut p.inlines);
+                content.remove(0);
+            }
+            _ => {}
+        }
+        blocks.push(FBlock::Para(head));
+        blocks.extend(content);
+    }
     if blocks.is_empty() {
         blocks.push(FBlock::Para(Para::default()));
     }
-    model::Flow { blocks, meta: Default::default() }
+    model::Flow { blocks, meta }
+}
+
+/// Lines of a front matter block at the very start (`---` … `---`/`...`, or `+++` … `+++`).
+fn front_matter_lines(lines: &[String]) -> Option<usize> {
+    let open = lines.first()?.trim_end();
+    let closes: &[&str] = match open {
+        "---" => &["---", "..."],
+        "+++" => &["+++"],
+        _ => return None,
+    };
+    let mut bytes = 0usize;
+    for (k, l) in lines.iter().enumerate().skip(1) {
+        bytes = bytes.saturating_add(l.len() + 1);
+        if bytes > MAX_FRONT_MATTER {
+            return None;
+        }
+        if closes.contains(&l.trim_end()) {
+            return Some(k + 1);
+        }
+    }
+    None
+}
+
+/// A top-level single-line string `key: value` (YAML) or `key = "value"` (TOML) in front matter.
+fn front_matter_value(fm: &str, key: &str) -> Option<String> {
+    fm.lines().skip(1).find_map(|l| line_value(l, key))
+}
+
+/// The value of a `key: value` / `key = value` front matter line.
+fn line_value(l: &str, key: &str) -> Option<String> {
+    let rest = l.strip_prefix(key)?.trim_start_matches(' ');
+    let v = rest.strip_prefix(':').or_else(|| rest.strip_prefix('='))?.trim();
+    scalar(v)
+}
+
+/// A YAML/TOML scalar written on one line: plain, `"double"` (escapes) or `'single'` quoted.
+fn scalar(v: &str) -> Option<String> {
+    if let Some(inner) = v.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    let rest = chars.as_str().trim();
+                    return (rest.is_empty() || rest.starts_with('#')).then_some(out);
+                }
+                '\\' => match chars.next()? {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                    }
+                    c => out.push(c),
+                },
+                c => out.push(c),
+            }
+        }
+        return None;
+    }
+    if let Some(inner) = v.strip_prefix('\'') {
+        let end = inner.rfind('\'')?;
+        let rest = inner.get(end + 1..)?.trim();
+        return (rest.is_empty() || rest.starts_with('#')).then(|| inner.get(..end).unwrap_or("").replace("''", "'"));
+    }
+    // Plain: up to a comment. Block scalars, lists and maps aren't single-line strings.
+    let v = v.split(" #").next().unwrap_or("").trim();
+    if v.is_empty() || v.starts_with(['|', '>', '[', '{', '&', '*', '!', '-', '#']) {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// `[^label]: rest` at the start of a (container-stripped) line.
+fn note_def_start(t: &str) -> Option<(&str, &str)> {
+    let r = t.strip_prefix("[^")?;
+    let close = r.find(']')?;
+    let label = r.get(..close)?;
+    let rest = r.get(close + 1..)?.strip_prefix(':')?;
+    valid_label(label).then_some((label, rest))
+}
+
+fn valid_label(l: &str) -> bool {
+    !l.is_empty() && l.len() <= MAX_LABEL && !l.contains(|c: char| c.is_whitespace() || c == '[' || c == ']')
+}
+
+/// Labels match case-insensitively.
+fn norm_label(l: &str) -> String {
+    l.to_lowercase()
+}
+
+/// Give note references their definitions' content; references inside notes (Word can't nest
+/// notes) and ones without a definition become their `[^label]` text.
+fn resolve_notes(blocks: &mut [FBlock], defs: &[(String, String, Vec<FBlock>)], in_note: bool, depth: usize) {
+    if depth > MAX_NEST {
+        return;
+    }
+    for b in blocks {
+        match b {
+            FBlock::Para(p) => {
+                let old = std::mem::take(&mut p.inlines);
+                for i in old {
+                    let Inline::Note(n) = i else {
+                        p.inlines.push(i);
+                        continue;
+                    };
+                    let key = norm_label(&n.label);
+                    match defs.iter().find(|d| d.0 == key) {
+                        Some((_, label, content)) if !in_note => {
+                            let mut content = content.clone();
+                            resolve_notes(&mut content, defs, true, depth + 1);
+                            p.inlines.push(Inline::Note(Note { label: label.clone(), blocks: content }));
+                        }
+                        _ => p.push_text(&format!("[^{}]", n.label), &Fmt::default()),
+                    }
+                }
+            }
+            FBlock::Table(t) => {
+                for c in t.rows.iter_mut().flatten() {
+                    resolve_notes(&mut c.blocks, defs, in_note, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Normalized labels of the notes in `blocks` (tables included).
+fn used_labels(blocks: &[FBlock]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<&[FBlock]> = vec![blocks];
+    while let Some(bl) = stack.pop() {
+        for b in bl {
+            match b {
+                FBlock::Para(p) => {
+                    out.extend(p.inlines.iter().filter_map(|i| if let Inline::Note(n) = i { Some(norm_label(&n.label)) } else { None }))
+                }
+                FBlock::Table(t) => stack.extend(t.rows.iter().flatten().map(|c| c.blocks.as_slice())),
+            }
+        }
+    }
+    out
 }
 
 /// Leading tabs → spaces (tab stops of 4); the rest of the line is kept.
@@ -216,16 +432,17 @@ fn interrupts(l: &str) -> bool {
         || thematic_break(t)
         || fence(t).is_some()
         || t.starts_with('>')
+        || note_def_start(t).is_some()
         || list_marker(t).is_some_and(|m| (!m.ordered || m.start == 1) && !is_blank(t.get(m.len..).unwrap_or("")))
 }
 
-fn flush_para(lines: &mut Vec<String>, out: &mut Vec<FBlock>, depth: usize) {
+fn flush_para(lines: &mut Vec<String>, out: &mut Vec<FBlock>, depth: usize, cx: &Cx) {
     if lines.is_empty() {
         return;
     }
     let text = join_lines(lines);
     lines.clear();
-    let p = Para { inlines: parse_inlines(&text, &Fmt::default(), depth), ..Default::default() };
+    let p = Para { inlines: inlines_cx(&text, &Fmt::default(), depth, cx), ..Default::default() };
     out.push(FBlock::Para(p));
 }
 
@@ -257,14 +474,27 @@ fn code_para(line: &str) -> FBlock {
     FBlock::Para(p)
 }
 
+/// A block of MDX source kept as written.
+fn raw_para(lines: &[&str]) -> FBlock {
+    let mut p = Para::new(Kind::Raw);
+    p.push_text(&lines.iter().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n"), &Fmt::default());
+    FBlock::Para(p)
+}
+
+/// Does this MDX line start a block that is kept verbatim (to the next blank line)?
+fn mdx_block_start(t: &str, depth: usize) -> bool {
+    let tag = t.strip_prefix('<').and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '>');
+    tag || t.starts_with('{') || (depth == 0 && (t.starts_with("import ") || t.starts_with("export ")))
+}
+
 /// Parse block structure. `level` is the list nesting level for lists found here.
-fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
+fn parse_blocks(lines: &[String], depth: usize, level: u8, cx: &mut Cx) -> Vec<FBlock> {
     let mut out = Vec::new();
     let mut para: Vec<String> = Vec::new();
     let mut i = 0;
     while let Some(line) = lines.get(i) {
         if is_blank(line) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, cx);
             i += 1;
             continue;
         }
@@ -294,6 +524,49 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             continue;
         }
         let t = line.trim_start();
+        if cx.mdx && para.is_empty() && mdx_block_start(t, depth) {
+            let mut block: Vec<&str> = Vec::new();
+            while let Some(l) = lines.get(i).filter(|l| !is_blank(l)) {
+                block.push(l);
+                i += 1;
+            }
+            out.push(raw_para(&block));
+            continue;
+        }
+        if let Some((label, first)) = note_def_start(t) {
+            flush_para(&mut para, &mut out, depth, cx);
+            let mut body: Vec<String> = vec![first.strip_prefix(' ').unwrap_or(first).to_string()];
+            i += 1;
+            while let Some(l) = lines.get(i) {
+                if is_blank(l) {
+                    body.push(String::new());
+                } else if indent(l) >= 4 {
+                    body.push(strip_indent(l, 4).to_string());
+                } else if body.last().is_some_and(|x| !is_blank(x)) && !interrupts(l) {
+                    // Lazy continuation of the note's paragraph.
+                    body.push(l.trim_start().to_string());
+                } else {
+                    break;
+                }
+                i += 1;
+            }
+            while body.last().is_some_and(|x| x.is_empty()) {
+                body.pop();
+            }
+            let content = if depth >= MAX_NEST {
+                let mut p = Para::default();
+                p.push_text(&body.join(" "), &Fmt::default());
+                vec![FBlock::Para(p)]
+            } else {
+                parse_blocks(&body, depth + 1, 0, cx)
+            };
+            let key = norm_label(label);
+            // The first definition of a label wins.
+            if !cx.defs.iter().any(|d| d.0 == key) {
+                cx.defs.push((key, label.to_string(), content));
+            }
+            continue;
+        }
         // Setext heading underline.
         if !para.is_empty() {
             let u = t.trim_end();
@@ -302,28 +575,28 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
                 let text = join_lines(&para);
                 para.clear();
                 let mut p = Para::new(Kind::Heading(lvl));
-                p.inlines = parse_inlines(&text, &Fmt::default(), depth);
+                p.inlines = inlines_cx(&text, &Fmt::default(), depth, cx);
                 out.push(FBlock::Para(p));
                 i += 1;
                 continue;
             }
         }
         if let Some((n, body)) = atx_heading(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, cx);
             let mut p = Para::new(Kind::Heading(n));
-            p.inlines = parse_inlines(body, &Fmt::default(), depth);
+            p.inlines = inlines_cx(body, &Fmt::default(), depth, cx);
             out.push(FBlock::Para(p));
             i += 1;
             continue;
         }
         if thematic_break(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, cx);
             out.push(FBlock::Para(Para::new(Kind::Rule)));
             i += 1;
             continue;
         }
         if let Some((fc, fl)) = fence(t) {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, cx);
             i += 1;
             while let Some(l) = lines.get(i) {
                 i += 1;
@@ -336,7 +609,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             continue;
         }
         if t.starts_with('>') {
-            flush_para(&mut para, &mut out, depth);
+            flush_para(&mut para, &mut out, depth, cx);
             let mut inner: Vec<String> = Vec::new();
             while let Some(l) = lines.get(i) {
                 let lt = l.trim_start();
@@ -355,7 +628,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
                 p.push_text(&inner.join(" "), &Fmt::default());
                 out.push(FBlock::Para(p));
             } else {
-                for mut b in parse_blocks(&inner, depth + 1, level) {
+                for mut b in parse_blocks(&inner, depth + 1, level, cx) {
                     if let FBlock::Para(p) = &mut b
                         && p.kind == Kind::Normal
                     {
@@ -374,7 +647,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
             if head.len() == aligns.len() {
                 let mut table = FTable::default();
                 let cell = |s: &str, header: bool, a: Option<Align>| {
-                    let p = Para { align: a, inlines: parse_inlines(s, &Fmt::default(), depth), ..Default::default() };
+                    let p = Para { align: a, inlines: inlines_cx(s, &Fmt::default(), depth, cx), ..Default::default() };
                     Cell { blocks: vec![FBlock::Para(p)], header, ..Default::default() }
                 };
                 table.rows.push(head.iter().zip(&aligns).map(|(s, a)| cell(s, true, *a)).collect());
@@ -395,19 +668,19 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8) -> Vec<FBlock> {
         if let Some(m) = list_marker(t)
             && (para.is_empty() || ((!m.ordered || m.start == 1) && !is_blank(t.get(m.len..).unwrap_or(""))))
         {
-            flush_para(&mut para, &mut out, depth);
-            i = parse_list(lines, i, depth, level, &mut out);
+            flush_para(&mut para, &mut out, depth, cx);
+            i = parse_list(lines, i, depth, level, &mut out, cx);
             continue;
         }
         para.push(line.clone());
         i += 1;
     }
-    flush_para(&mut para, &mut out, depth);
+    flush_para(&mut para, &mut out, depth, cx);
     out
 }
 
 /// Parse a list starting at `lines[i]`; returns the index after it.
-fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>) -> usize {
+fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>, cx: &mut Cx) -> usize {
     let Some(first) = lines.get(i).and_then(|l| list_marker(l.trim_start())) else { return i + 1 };
     while let Some(line) = lines.get(i) {
         let ind = indent(line);
@@ -451,7 +724,7 @@ fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut
             p.push_text(&item.join(" "), &Fmt::default());
             vec![FBlock::Para(p)]
         } else {
-            parse_blocks(&item, depth + 1, level.saturating_add(1).min(8))
+            parse_blocks(&item, depth + 1, level.saturating_add(1).min(8), cx)
         };
         let mut placed = false;
         if inner.is_empty() {
@@ -525,8 +798,58 @@ fn is_punct(c: char) -> bool {
 
 /// Parse inline Markdown into formatted spans (on top of `base`).
 pub fn parse_inlines(s: &str, base: &Fmt, depth: usize) -> Vec<Inline> {
-    let nodes = tokenize(s, base, depth);
+    inlines_cx(s, base, depth, &Cx::default())
+}
+
+fn inlines_cx(s: &str, base: &Fmt, depth: usize, cx: &Cx) -> Vec<Inline> {
+    let nodes = tokenize(s, base, depth, cx);
     emit(nodes)
+}
+
+/// A footnote reference `[^label]` at byte `at` with a definition somewhere: (label, end).
+fn note_ref<'a>(s: &'a str, at: usize, cx: &Cx) -> Option<(&'a str, usize)> {
+    let r = s.get(at..)?.strip_prefix("[^")?;
+    let close = r.find(']')?;
+    let label = r.get(..close)?;
+    let end = at + 2 + close + 1;
+    if !valid_label(label) || !cx.labels.contains(&norm_label(label)) {
+        return None;
+    }
+    // `[^x](url)` is a link.
+    if s.get(end..).is_some_and(|r| r.starts_with('(')) && link_dest(s, end).is_some() {
+        return None;
+    }
+    Some((label, end))
+}
+
+/// The end (exclusive) of an MDX JSX tag at byte `at` (`<`) or `{expression}` (`{`): quotes and
+/// nested braces respected.
+fn mdx_span_end(s: &str, at: usize) -> Option<usize> {
+    let open = s.as_bytes().get(at).copied()?;
+    let mut braces = 0usize;
+    let mut quote: Option<char> = None;
+    for (k, c) in s.get(at..)?.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' if k > 0 => quote = Some(c),
+            '{' => braces += 1,
+            '}' => {
+                braces = braces.checked_sub(1)?;
+                if open == b'{' && braces == 0 {
+                    return Some(at + k + 1);
+                }
+            }
+            '>' if open == b'<' && braces == 0 => return Some(at + k + 1),
+            '\n' if open == b'<' && k == 1 => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn push_text(nodes: &mut Vec<Node>, s: &str, f: &Fmt) {
@@ -685,7 +1008,7 @@ fn tag_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
+fn tokenize(s: &str, base: &Fmt, depth: usize, cx: &Cx) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
     let b = s.as_bytes();
     let mut i = 0usize;
@@ -756,6 +1079,15 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                 text_start = i;
             }
             b'!' | b'[' if depth < MAX_NEST => {
+                if c == b'['
+                    && let Some((label, end)) = note_ref(s, i, cx)
+                {
+                    flush!();
+                    nodes.push(Node::Inl(Inline::Note(Note { label: label.to_string(), blocks: Vec::new() })));
+                    i = end;
+                    text_start = i;
+                    continue;
+                }
                 let img = c == b'!';
                 let open = if img { i + 1 } else { i };
                 let parsed = if b.get(open) == Some(&b'[') {
@@ -769,7 +1101,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                 match parsed {
                     Some((inner, dest, end)) if img => {
                         flush!();
-                        let alt: String = parse_inlines(&inner, &Fmt::default(), depth + 1)
+                        let alt: String = inlines_cx(&inner, &Fmt::default(), depth + 1, cx)
                             .iter()
                             .filter_map(|x| if let Inline::Text(t, _) = x { Some(t.as_str()) } else { None })
                             .collect();
@@ -784,7 +1116,7 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                         flush!();
                         let mut f = base.clone();
                         f.link = Some(dest);
-                        for x in parse_inlines(&inner, &f, depth + 1) {
+                        for x in inlines_cx(&inner, &f, depth + 1, cx) {
                             nodes.push(Node::Inl(x));
                         }
                         i = end;
@@ -820,10 +1152,27 @@ fn tokenize(s: &str, base: &Fmt, depth: usize) -> Vec<Node> {
                     }
                     i += inner.len() + 2 + 4;
                     text_start = i;
+                } else if cx.mdx
+                    && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '>')
+                    && let Some(end) = mdx_span_end(s, i)
+                {
+                    flush!();
+                    push_text(&mut nodes, s.get(i..end).unwrap_or(""), &Fmt { raw: true, ..base.clone() });
+                    i = end;
+                    text_start = i;
                 } else {
                     i += 1;
                 }
             }
+            b'{' if cx.mdx => match mdx_span_end(s, i) {
+                Some(end) => {
+                    flush!();
+                    push_text(&mut nodes, s.get(i..end).unwrap_or(""), &Fmt { raw: true, ..base.clone() });
+                    i = end;
+                    text_start = i;
+                }
+                None => i += 1,
+            },
             b'&' => {
                 let rest = s.get(i..).unwrap_or("");
                 match rest.find(';').filter(|k| *k <= 32).and_then(|k| decode_entity(rest.get(1..k)?).map(|ch| (ch, k))) {
@@ -987,12 +1336,103 @@ fn emit(mut nodes: Vec<Node>) -> Vec<Inline> {
 // ---------------------------------------------------------------------------------------------
 // Export
 
-/// Escape text for Markdown (inline context).
-fn escape(s: &str) -> String {
+/// Export state: the format and the footnotes written so far.
+#[derive(Default)]
+struct Ex {
+    mdx: bool,
+    /// Writing a note's content (notes don't nest).
+    in_note: bool,
+    /// Normalized labels in use or kept for notes that have them.
+    taken: HashSet<String>,
+    /// Last number given to a note without a label.
+    next: u32,
+    /// Definitions in reference order: (label, Markdown content).
+    defs: Vec<(String, String)>,
+}
+
+/// Longest run of notes tried for a free `label-n`.
+const MAX_SUFFIX: u32 = 10_000;
+
+impl Ex {
+    /// The `[^label]` reference for note `n`, recording its definition. A label used again with
+    /// the same content refers to the same definition (Markdown's way of citing a note twice).
+    fn note_ref(&mut self, n: &Note) -> Option<String> {
+        if self.in_note {
+            return None;
+        }
+        self.in_note = true;
+        let mut lines = Vec::new();
+        write_blocks(&n.blocks, &mut lines, self);
+        self.in_note = false;
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let body = lines.join("\n");
+        let label = if valid_label(&n.label) {
+            let mut cand = n.label.clone();
+            let mut k = 1u32;
+            loop {
+                let key = norm_label(&cand);
+                match self.defs.iter().find(|d| norm_label(&d.0) == key) {
+                    Some(d) if d.1 == body => return Some(format!("[^{}]", d.0)),
+                    None if k == 1 || !self.taken.contains(&key) => break cand,
+                    _ if k >= MAX_SUFFIX => return None,
+                    _ => {
+                        k += 1;
+                        cand = format!("{}-{k}", n.label);
+                    }
+                }
+            }
+        } else {
+            loop {
+                self.next = self.next.checked_add(1)?;
+                let cand = self.next.to_string();
+                if !self.taken.contains(&cand) {
+                    break cand;
+                }
+            }
+        };
+        self.taken.insert(norm_label(&label));
+        self.defs.push((label.clone(), body));
+        Some(format!("[^{label}]"))
+    }
+}
+
+/// Labels of the notes in `blocks`, normalized.
+fn note_labels(blocks: &[FBlock], out: &mut HashSet<String>, depth: usize) {
+    if depth > MAX_NEST {
+        return;
+    }
+    for b in blocks {
+        match b {
+            FBlock::Para(p) => {
+                for i in &p.inlines {
+                    if let Inline::Note(n) = i
+                        && valid_label(&n.label)
+                    {
+                        out.insert(norm_label(&n.label));
+                    }
+                }
+            }
+            FBlock::Table(t) => {
+                for c in t.rows.iter().flatten() {
+                    note_labels(&c.blocks, out, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Escape text for Markdown (inline context); MDX also escapes `{` and `}`.
+fn escape(s: &str, mdx: bool) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
             '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~' | '|' | '&' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '{' | '}' if mdx => {
                 out.push('\\');
                 out.push(c);
             }
@@ -1053,7 +1493,7 @@ enum Mark {
 }
 
 /// Inline spans → Markdown with properly nested markers.
-fn inlines_md(inlines: &[Inline]) -> String {
+fn inlines_md(inlines: &[Inline], ex: &mut Ex) -> String {
     // Split into (text, fmt) pieces with whitespace moved outside emphasis.
     let mut pieces: Vec<(String, Fmt, Option<String>)> = Vec::new();
     let inlines = crate::model::equations_as_text(inlines);
@@ -1081,11 +1521,16 @@ fn inlines_md(inlines: &[Inline]) -> String {
             }
             Inline::Image(img) => {
                 let name = format!("image.{}", img.ext);
-                pieces.push((String::new(), Fmt::default(), Some(format!("![{}]({})", escape(&img.alt), name))));
+                pieces.push((String::new(), Fmt::default(), Some(format!("![{}]({})", escape(&img.alt, ex.mdx), name))));
             }
             Inline::Anchor(a) => {
                 let safe: String = a.chars().filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')).collect();
                 pieces.push((String::new(), Fmt::default(), Some(format!("<a id=\"{safe}\"></a>"))));
+            }
+            Inline::Note(n) => {
+                if let Some(r) = ex.note_ref(n) {
+                    pieces.push((String::new(), Fmt::default(), Some(r)));
+                }
             }
             Inline::Equation { .. } => {}
         }
@@ -1131,10 +1576,12 @@ fn inlines_md(inlines: &[Inline]) -> String {
                 stack.push(m);
             }
         }
-        if f.code {
+        if f.raw {
+            out.push_str(&text);
+        } else if f.code {
             out.push_str(&code_span(&text));
         } else {
-            out.push_str(&escape(&text).replace('\n', "\\\n").replace('\t', "    "));
+            out.push_str(&escape(&text, ex.mdx).replace('\n', "\\\n").replace('\t', "    "));
         }
     }
     close_all(&mut out, &mut stack);
@@ -1156,32 +1603,36 @@ fn marker(m: Mark) -> &'static str {
     }
 }
 
-fn table_md(t: &FTable, out: &mut Vec<String>) {
+fn cell_md(c: &Cell, ex: &mut Ex) -> String {
+    let mut parts = Vec::new();
+    for b in &c.blocks {
+        match b {
+            FBlock::Para(p) => parts.push(inlines_md(&p.inlines, ex).replace("\\\n", "<br>")),
+            FBlock::Table(inner) => {
+                parts.push(escape(&inner.rows.iter().flat_map(|r| r.iter().map(Cell::text)).collect::<Vec<_>>().join(" "), ex.mdx))
+            }
+        }
+    }
+    parts.join("<br>").replace('\n', " ")
+}
+
+fn row_md(r: &[Cell], cols: usize, ex: &mut Ex) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for c in r {
+        v.push(if c.covered { String::new() } else { cell_md(c, ex) });
+        for _ in 1..c.colspan.clamp(1, 63) {
+            v.push(String::new());
+        }
+    }
+    v.resize(cols, String::new());
+    v
+}
+
+fn table_md(t: &FTable, out: &mut Vec<String>, ex: &mut Ex) {
     let cols = t.cols().max(1);
-    let cell_md = |c: &Cell| -> String {
-        let mut parts = Vec::new();
-        for b in &c.blocks {
-            match b {
-                FBlock::Para(p) => parts.push(inlines_md(&p.inlines).replace("\\\n", "<br>")),
-                FBlock::Table(inner) => parts.push(escape(&inner.rows.iter().flat_map(|r| r.iter().map(Cell::text)).collect::<Vec<_>>().join(" "))),
-            }
-        }
-        parts.join("<br>").replace('\n', " ")
-    };
     let align_of = |c: &Cell| c.blocks.iter().find_map(|b| if let FBlock::Para(p) = b { Some(p.align) } else { None }).flatten();
-    let row_md = |r: &Vec<Cell>| -> Vec<String> {
-        let mut v: Vec<String> = Vec::new();
-        for c in r {
-            v.push(if c.covered { String::new() } else { cell_md(c) });
-            for _ in 1..c.colspan.clamp(1, 63) {
-                v.push(String::new());
-            }
-        }
-        v.resize(cols, String::new());
-        v
-    };
     let Some(head) = t.rows.first() else { return };
-    out.push(format!("| {} |", row_md(head).join(" | ")));
+    out.push(format!("| {} |", row_md(head, cols, ex).join(" | ")));
     let mut aligns: Vec<Option<Align>> = Vec::new();
     for c in head {
         aligns.push(align_of(c));
@@ -1200,15 +1651,49 @@ fn table_md(t: &FTable, out: &mut Vec<String>) {
         .collect();
     out.push(format!("| {} |", delim.join(" | ")));
     for r in t.rows.iter().skip(1) {
-        out.push(format!("| {} |", row_md(r).join(" | ")));
+        out.push(format!("| {} |", row_md(r, cols, ex).join(" | ")));
     }
 }
 
 /// Markdown text of a document.
 pub fn export(doc: &Document) -> String {
+    export_with(doc, false)
+}
+
+/// MDX text of a document.
+pub fn export_mdx(doc: &Document) -> String {
+    export_with(doc, true)
+}
+
+fn export_with(doc: &Document, mdx: bool) -> String {
     let flow = model::from_doc(doc);
     let mut out: Vec<String> = Vec::new();
-    write_blocks(&flow.blocks, &mut out);
+    if !flow.meta.front_matter.is_empty() {
+        out.extend(updated_front_matter(&flow.meta).lines().map(str::to_string));
+        out.push(String::new());
+    }
+    let mut ex = Ex { mdx, ..Default::default() };
+    note_labels(&flow.blocks, &mut ex.taken, 0);
+    write_blocks(&flow.blocks, &mut out, &mut ex);
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    if !ex.defs.is_empty() {
+        out.push(String::new());
+        for (label, body) in std::mem::take(&mut ex.defs) {
+            let mut lines = body.lines();
+            out.push(format!("[^{label}]: {}", lines.next().unwrap_or("")).trim_end().to_string());
+            let mut more = false;
+            for l in lines {
+                more = true;
+                out.push(if l.is_empty() { String::new() } else { format!("    {l}") });
+            }
+            // A note of several lines ends with a blank line, so the next definition stands apart.
+            if more {
+                out.push(String::new());
+            }
+        }
+    }
     let mut s = out.join("\n");
     while s.ends_with("\n\n") {
         s.pop();
@@ -1219,7 +1704,49 @@ pub fn export(doc: &Document) -> String {
     s
 }
 
-fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
+/// The front matter with `title`, `description` and `author` lines updated to the document's
+/// properties where they were changed. Lines that aren't single-line strings are left alone.
+fn updated_front_matter(m: &Meta) -> String {
+    let fm = &m.front_matter;
+    let toml = fm.starts_with("+++");
+    let mut lines: Vec<String> = fm.lines().map(str::to_string).collect();
+    for (key, value) in [("title", &m.title), ("description", &m.description), ("author", &m.author)] {
+        if value.is_empty() || front_matter_value(fm, key).is_none_or(|old| old == *value) {
+            continue;
+        }
+        let Some(line) = lines.iter_mut().skip(1).find(|l| line_value(l, key).is_some()) else {
+            continue;
+        };
+        let quoted = || {
+            let mut q = String::from('"');
+            for c in value.chars() {
+                match c {
+                    '"' => q.push_str("\\\""),
+                    '\\' => q.push_str("\\\\"),
+                    '\n' => q.push_str("\\n"),
+                    '\t' => q.push_str("\\t"),
+                    c if c.is_control() => q.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => q.push(c),
+                }
+            }
+            q.push('"');
+            q
+        };
+        let old = line.split_once([':', '=']).map(|(_, v)| v.trim_start()).unwrap_or("");
+        *line = if toml {
+            format!("{key} = {}", quoted())
+        } else if old.starts_with('\'') && !value.contains(|c: char| c.is_control()) {
+            format!("{key}: '{}'", value.replace('\'', "''"))
+        } else if !old.starts_with('"') && scalar(value).as_deref() == Some(value.as_str()) && !value.contains([':', '#', '"', '\'']) {
+            format!("{key}: {value}")
+        } else {
+            format!("{key}: {}", quoted())
+        };
+    }
+    lines.join("\n")
+}
+
+fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>, ex: &mut Ex) {
     let mut i = 0;
     let mut counters = [0u32; 9];
     let mut prev_list = false;
@@ -1227,7 +1754,12 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
     while let Some(b) = blocks.get(i) {
         match b {
             FBlock::Table(t) => {
-                table_md(t, out);
+                table_md(t, out, ex);
+                out.push(String::new());
+                prev_list = false;
+            }
+            FBlock::Para(p) if p.kind == Kind::Raw && p.list.is_none() => {
+                out.extend(p.text().lines().map(str::to_string));
                 out.push(String::new());
                 prev_list = false;
             }
@@ -1250,7 +1782,7 @@ fn write_blocks(blocks: &[FBlock], out: &mut Vec<String>) {
                 continue;
             }
             FBlock::Para(p) => {
-                let body = inlines_md(&p.inlines);
+                let body = if p.kind == Kind::Raw { p.text() } else { inlines_md(&p.inlines, ex) };
                 match p.list {
                     Some(li) => {
                         let lv = li.level.min(8) as usize;
@@ -1380,7 +1912,7 @@ mod tests {
     fn export_escapes_round_trip() {
         let mut p = Para::default();
         p.push_text("1. not a list *really*", &Fmt::default());
-        let md = escape_line_start(inlines_md(&p.inlines));
+        let md = escape_line_start(inlines_md(&p.inlines, &mut Ex::default()));
         let back = parse(&md);
         let FBlock::Para(q) = &back.blocks[0] else { panic!() };
         assert_eq!(q.text(), "1. not a list *really*");
