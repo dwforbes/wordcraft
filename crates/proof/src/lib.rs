@@ -44,6 +44,32 @@ pub fn add_word(w: &str) {
     user_words().write().unwrap_or_else(|e| e.into_inner()).insert(w.to_lowercase());
 }
 
+/// The custom document property holding the words Ignore All skips in that document
+/// (lowercase, space-separated). It is saved with the document, so they stay ignored.
+pub const IGNORED_WORDS_PROP: &str = "WordCraftIgnoredWords";
+
+/// At most this many words are kept in a document's ignore list.
+pub const MAX_IGNORED_WORDS: usize = 5_000;
+
+/// `word` is in an ignore list (the [`IGNORED_WORDS_PROP`] value); case doesn't matter.
+pub fn is_ignored(list: &str, word: &str) -> bool {
+    let w = word.to_lowercase();
+    list.split_whitespace().any(|x| x == w)
+}
+
+/// `list` with `word` added (lowercase, sorted, no duplicates). Words with spaces can't be
+/// listed and leave the list as it was.
+pub fn with_ignored(list: &str, word: &str) -> String {
+    let w = word.trim().to_lowercase();
+    let mut v: Vec<&str> = list.split_whitespace().collect();
+    if !w.is_empty() && !w.contains(char::is_whitespace) && v.len() < MAX_IGNORED_WORDS {
+        v.push(&w);
+    }
+    v.sort_unstable();
+    v.dedup();
+    v.join(" ")
+}
+
 /// Words in the user dictionary.
 pub fn user_dictionary() -> Vec<String> {
     let mut v: Vec<String> = user_words().read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();

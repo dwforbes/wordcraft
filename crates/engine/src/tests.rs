@@ -1598,3 +1598,105 @@ fn spelling_and_grammar_finds_nonstandard_grammar() {
     run(&mut s, "review.applySuggestion", json!({"text": "don't"}));
     assert!(text(&s).starts_with("I don't think it do"));
 }
+
+/// Select from `from` to `to` (byte offsets) in body paragraph `para`.
+fn select_in(s: &mut Session, para: u32, from: usize, to: usize) {
+    let p = |off: usize| json!({"story": "body", "path": [para], "off": off});
+    run(s, "select.range", json!({"anchor": p(from), "focus": p(to)}));
+}
+
+#[test]
+fn spelling_checks_only_the_selection() {
+    let mut s = s();
+    let t = "One blorfle. Two zibbet. Three wuggle.";
+    run(&mut s, "text.insert", json!({"text": t}));
+    let (a, b) = (t.find("Two").unwrap_or(0), t.find(" Three").unwrap_or(0));
+    select_in(&mut s, 0, a, b);
+    let r = run(&mut s, "review.spelling", json!({}));
+    assert_eq!((r["text"].as_str(), r["scope"].as_str()), (Some("zibbet"), Some("selection")));
+    let r = run(&mut s, "review.spelling", json!({"continue": true}));
+    assert_eq!((r["done"].as_bool(), r["scope"].as_str()), (Some(true), Some("selection")));
+    assert_eq!(r["end"]["off"], b);
+    assert_eq!(s.status, "The spelling and grammar check of the selection is complete.");
+    // The check of the selection is over: F7 from a caret checks the document again.
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "blorfle");
+    assert!(s.proof_scope.is_none());
+}
+
+#[test]
+fn spelling_selection_end_follows_a_longer_change() {
+    let mut s = s();
+    let t = "A blorfle then zibbet. Outside wuggle.";
+    run(&mut s, "text.insert", json!({"text": t}));
+    select_in(&mut s, 0, 0, t.find(" Outside").unwrap_or(0));
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "blorfle");
+    // 4 bytes longer: without moving the selection's end, "zibbet" would fall outside it.
+    run(&mut s, "review.applySuggestion", json!({"text": "wonderfully"}));
+    assert_eq!(run(&mut s, "review.spelling", json!({"continue": true}))["text"], "zibbet");
+    run(&mut s, "review.ignoreOnce", json!({}));
+    assert_eq!(run(&mut s, "review.spelling", json!({"continue": true}))["scope"], "selection");
+}
+
+#[test]
+fn ignore_once_survives_edits_elsewhere_in_the_paragraph() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "A blorfle and a zibbet."}));
+    let at = "A blorfle and a ".len();
+    select_in(&mut s, 0, at, at + "zibbet".len());
+    run(&mut s, "review.ignoreOnce", json!({}));
+    // Typing before it moves its offsets; it stays ignored.
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "text.insert", json!({"text": "Then "}));
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(spelling_walk(&mut s, 10), ["blorfle"]);
+}
+
+#[test]
+fn ignore_all_is_for_this_document_and_saved_with_it() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Use photocraft and filmcraft. More photocraft."}));
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(run(&mut s, "review.spelling", json!({}))["text"], "photocraft");
+    run(&mut s, "review.ignoreAll", json!({}));
+    let issues = |s: &mut Session| -> Vec<String> {
+        run(s, "review.issues", json!({}))
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["text"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(issues(&mut s), ["filmcraft"]);
+    // Not the dictionary: other documents still flag it.
+    assert!(!wordcraft_proof::user_dictionary().contains(&"photocraft".to_string()));
+    let mut other = Session::new(wordcraft_doc::Document::new());
+    run(&mut other, "text.insert", json!({"text": "photocraft"}));
+    assert_eq!(issues(&mut other), ["photocraft"]);
+    // The squiggles skip it too.
+    let para = s.doc.para(StoryRef::Body, &wordcraft_doc::Path(vec![0])).cloned();
+    let squiggled: Vec<_> = para.map(|p| wordcraft_layout::para::paragraph_issues(&s.doc, &p)).unwrap_or_default();
+    assert_eq!(squiggled.len(), 1);
+    // Saved with the document, so it is still ignored after reopening.
+    let bytes = crate::io::save_bytes("x.docx", &s.doc).unwrap();
+    let mut reopened = Session::new(crate::io::open_bytes("x.docx", &bytes).unwrap());
+    assert_eq!(issues(&mut reopened), ["filmcraft"]);
+    // Undo takes it back; Recheck Document forgets it.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(issues(&mut s), ["photocraft", "filmcraft", "photocraft"]);
+    run(&mut reopened, "review.recheckDocument", json!({}));
+    assert_eq!(issues(&mut reopened), ["photocraft", "filmcraft", "photocraft"]);
+    // A phrase can't be listed.
+    assert!(s.run("review.ignoreAll", &json!({"word": "two words"})).is_err());
+}
+
+#[test]
+fn one_issue_per_word_when_spelling_and_grammar_both_flag_it() {
+    // Harper also flags unknown compounds ("photo craft"): one issue, so one Ignore Once does.
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Try photocraft today."}));
+    let all = run(&mut s, "review.issues", json!({}));
+    let all = all.as_array().cloned().unwrap_or_default();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!((all[0]["kind"].as_str(), all[0]["suggestions"][0].as_str()), (Some("spelling"), Some("photo craft")));
+    run(&mut s, "caret.docStart", json!({}));
+    assert_eq!(spelling_walk(&mut s, 10), ["photocraft"]);
+}

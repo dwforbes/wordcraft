@@ -210,9 +210,12 @@ pub struct Session {
     pub math_latex: bool,
     /// Text typed into equations is normal (non-math) text.
     pub math_normal_text: bool,
-    /// Proofing issues skipped with Ignore Once: story, paragraph, byte range and the text it
-    /// covered (a key that no longer matches after an edit just stops applying).
-    pub proof_ignored: Vec<(StoryRef, wordcraft_doc::Path, usize, usize, String)>,
+    /// Proofing issues skipped with Ignore Once: story, paragraph, the text flagged and which
+    /// occurrence of that text among the paragraph's issues it is (so edits elsewhere in the
+    /// paragraph don't bring it back).
+    pub proof_ignored: Vec<(StoryRef, wordcraft_doc::Path, String, usize)>,
+    /// Spelling & Grammar is checking only this selection (start, end).
+    pub proof_scope: Option<(Pos, Pos)>,
 }
 
 /// The equation being edited.
@@ -230,11 +233,14 @@ pub struct MathEdit {
 pub struct Prefs {
     /// Word Count includes text boxes, footnotes and endnotes (Word's default).
     pub count_notes: bool,
+    /// Words added with Add to Dictionary (the front end loads them into the proofing
+    /// dictionary at start and saves them back).
+    pub dictionary: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { count_notes: true }
+        Prefs { count_notes: true, dictionary: Vec::new() }
     }
 }
 
@@ -287,6 +293,7 @@ impl Session {
             prefs: Prefs::default(),
             read_aloud: Default::default(),
             proof_ignored: Vec::new(),
+            proof_scope: None,
         }
     }
 
@@ -420,6 +427,7 @@ impl Session {
         self.sel = Selection::caret(self.doc.start_of(StoryRef::Body));
         self.pending = None;
         self.proof_ignored.clear();
+        self.proof_scope = None;
         self.reset_history();
         self.touch();
         self.dirty = false;
@@ -487,6 +495,7 @@ impl Session {
             math_latex: _,
             math_normal_text: _,
             proof_ignored: _,
+            proof_scope: _,
         } = self;
         let head = if history.len() + SNAPSHOT_HEAD > MAX_UNDO { history.iter().take(SNAPSHOT_HEAD).cloned().collect() } else { Vec::new() };
         EditSnapshot {

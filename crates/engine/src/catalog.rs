@@ -432,6 +432,7 @@ Editing|Selection|Extend Selection (F8)|select.extend
 Editing|Selection|Column Selection|select.column
 Tools|Proofing|AutoCorrect Options|tools.autocorrect
 Tools|Proofing|Set Proofing Language|review.language
+Tools|Proofing|Recheck Document|review.recheckDocument
 Tools|Customize|Customize Ribbon|tools.customizeRibbon
 Tools|Customize|Customize Keyboard|tools.customizeKeyboard
 Tools|Protection|Encrypt with Password|file.encrypt

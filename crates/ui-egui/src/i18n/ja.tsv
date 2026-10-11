@@ -882,3 +882,9 @@
 	Spelling	スペル
 	Grammar	文法
 	The spelling and grammar check is complete.	スペルと文法のチェックが終わりました。
+	Recheck Document	文書を再チェック
+	Check Rest of Document	文書の残りをチェック
+	Checking the selection	選択範囲をチェック中
+	The spelling and grammar check of the selection is complete.	選択範囲のスペルと文法のチェックが終わりました。
+	Ignore this word everywhere in this document	この文書ではこの単語をすべて無視
+	Accept this word in every document	すべての文書でこの単語を正しいとする

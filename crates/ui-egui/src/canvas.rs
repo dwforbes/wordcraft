@@ -156,6 +156,9 @@ fn page_key(app: &WordApp, page: &Page, scale_px: f32, dim_body: bool) -> u64 {
             match it {
                 Placed::Lines { para, l0, l1, x, y, .. } => {
                     (std::sync::Arc::as_ptr(para) as usize, l0, l1, x.to_bits(), y.to_bits()).hash(&mut h);
+                    // A relaid paragraph can land at the freed one's address: the squiggles
+                    // (Ignore All, Add to Dictionary…) must still repaint the page.
+                    para.issues.hash(&mut h);
                 }
                 Placed::Fill { rect, color } => format!("{rect:?}{color:?}").hash(&mut h),
                 Placed::Rule { x0, y0, x1, y1, border } => format!("{x0}{y0}{x1}{y1}{border:?}").hash(&mut h),
@@ -1094,6 +1097,21 @@ fn is_followable_link(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ignore All left the old squiggles on screen: the page image was keyed on paragraph
+    /// addresses, which a relayout can reuse.
+    #[test]
+    fn page_image_changes_when_squiggles_do() {
+        let mut app = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        app.execute("text.insert", serde_json::json!({"text": "Our photocraft app."})).unwrap();
+        let key = |app: &mut WordApp| {
+            let l = app.session.layout();
+            l.pages.first().map(|p| page_key(app, p, 1.0, false))
+        };
+        let before = key(&mut app);
+        app.execute("review.ignoreAll", serde_json::json!({"word": "photocraft"})).unwrap();
+        assert_ne!(key(&mut app), before);
+    }
 
     #[test]
     fn only_web_and_email_links_are_followed() {

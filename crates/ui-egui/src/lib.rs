@@ -238,6 +238,7 @@ impl WordApp {
         let mut ui = self.ui.clone();
         ui.author = self.session.author.clone();
         ui.editing = self.session.prefs.clone();
+        ui.editing.dictionary = wordcraft_engine::proof::user_dictionary();
         ui.read_aloud_rate = self.session.read_aloud.rate();
         ui.read_aloud_skip_citations = self.session.read_aloud.skip_citations;
         ui.dark_page = self.session.view.dark_mode;
@@ -254,6 +255,9 @@ impl WordApp {
             self.session.author = author;
         }
         self.session.prefs = std::mem::take(&mut self.ui.editing);
+        for w in self.session.prefs.dictionary.iter().take(50_000) {
+            wordcraft_engine::proof::add_word(w);
+        }
         self.session.read_aloud.set_rate(self.ui.read_aloud_rate);
         self.session.read_aloud.skip_citations = self.ui.read_aloud_skip_citations;
         self.session.view.dark_mode = self.ui.dark_page;
@@ -964,6 +968,38 @@ mod tests {
         assert_eq!(a.proofing, Some(json!({"done": true})));
         a.execute("ui.proofingPane", json!({"value": false})).unwrap();
         assert!(a.proofing.is_none());
+    }
+
+    /// With text selected, the pane checks only the selection, then offers the rest.
+    #[test]
+    fn spelling_pane_checks_the_selection_then_the_rest() {
+        let mut a = app();
+        a.execute("text.insert", json!({"text": "One blorfle. Two zibbet."})).unwrap();
+        let p = |off: usize| json!({"story": "body", "path": [0], "off": off});
+        a.execute("select.range", json!({"anchor": p(13), "focus": p(24)})).unwrap();
+        a.run("review.spelling", json!({})).unwrap();
+        let issue = a.proofing.clone().unwrap();
+        assert_eq!((issue["text"].as_str(), issue["scope"].as_str()), (Some("zibbet"), Some("selection")));
+        panes::proof_act(&mut a, &issue, "review.ignoreOnce", json!({}));
+        let done = a.proofing.clone().unwrap();
+        assert_eq!((done["done"].as_bool(), done["scope"].as_str()), (Some(true), Some("selection")));
+        // "Check Rest of Document": from the selection's end, wrapping to the top.
+        a.execute("caret.set", json!({"pos": done["end"]})).unwrap();
+        a.run("review.spelling", json!({})).unwrap();
+        assert_eq!(a.proofing.as_ref().map(|i| i["text"].clone()), Some(json!("blorfle")));
+    }
+
+    /// Add to Dictionary used to be forgotten when the app closed.
+    #[test]
+    fn added_words_are_saved_with_the_preferences() {
+        let mut first = app();
+        first.execute("review.addToDictionary", json!({"word": "Quuxcraft"})).unwrap();
+        let saved = serde_json::to_vec(&first.prefs()).unwrap();
+        let prefs: UiState = serde_json::from_slice(&saved).unwrap();
+        assert!(prefs.editing.dictionary.contains(&"quuxcraft".to_string()));
+        let mut second = app();
+        second.apply_prefs(prefs);
+        assert!(second.session.prefs.dictionary.contains(&"quuxcraft".to_string()));
     }
 
     /// An edit under the pane: its issue is gone, so the pane looks again instead of changing
@@ -1778,7 +1814,7 @@ mod tests {
         let mut a = app();
         a.session.run("review.wordCount", &json!({"includeTextBoxes": false})).unwrap();
         let saved = serde_json::to_string(&a.prefs()).unwrap();
-        assert!(saved.contains(r#""editing":{"countNotes":false}"#), "{saved}");
+        assert!(saved.contains(r#""editing":{"countNotes":false"#), "{saved}");
         let mut b = app();
         b.apply_prefs(serde_json::from_str(&saved).unwrap());
         assert!(!b.session.prefs.count_notes);

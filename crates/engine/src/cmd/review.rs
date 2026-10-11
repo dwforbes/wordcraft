@@ -42,19 +42,14 @@ pub fn specs() -> Vec<CommandSpec> {
         .pure(),
         CommandSpec::new("review.wordCount", "Word Count", "Review › Proofing", word_count).params(r#"{"includeTextBoxes"?: bool}"#).pure(),
         CommandSpec::new("review.changes", "Reviewing Pane", "Review › Tracking", list_changes).pure(),
-        CommandSpec::new("review.spelling", "Spelling & Grammar", "Review › Proofing", next_issue).key("F7").pure(),
+        CommandSpec::new("review.spelling", "Spelling & Grammar", "Review › Proofing", next_issue)
+            .key("F7")
+            .params(r#"{"continue"?: bool (carry on the check in progress)}"#)
+            .pure(),
         CommandSpec::new("review.issues", "Proofing Issues", "Review › Proofing", all_issues).pure(),
         CommandSpec::new("review.suggestions", "Spelling Suggestions", "Review › Proofing", suggestions).params(r#"{"pos"?: Pos}"#).pure(),
         CommandSpec::new("review.addToDictionary", "Add to Dictionary", "Review › Proofing", |s, v| {
-            let w = match p::str(v, "word") {
-                Some(w) => w.to_string(),
-                None => issue_at(s, &s.sel.focus.clone())
-                    .map(|(a, b, _)| s.doc.para_at(&a).and_then(|p| p.text.get(a.off..b.off).map(str::to_string)).unwrap_or_default())
-                    .unwrap_or_default(),
-            };
-            if w.is_empty() {
-                return Err(CmdError::Params("no word".into()));
-            }
+            let w = issue_word(s, v)?;
             wordcraft_proof::add_word(&w);
             s.relayout();
             Ok(json!({"added": w}))
@@ -62,26 +57,21 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{"word"?: string}"#)
         .pure(),
         CommandSpec::new("review.ignoreOnce", "Ignore Once", "Review › Proofing", ignore_once).params(r#"{"pos"?: Pos}"#).pure(),
-        CommandSpec::new("review.ignoreAll", "Ignore All", "Review › Proofing", |s, v| {
-            let w = match p::str(v, "word") {
-                Some(w) => w.to_string(),
-                None => issue_at(s, &s.sel.focus.clone())
-                    .map(|(a, b, _)| s.doc.para_at(&a).and_then(|p| p.text.get(a.off..b.off).map(str::to_string)).unwrap_or_default())
-                    .unwrap_or_default(),
-            };
-            if w.is_empty() {
-                return Err(CmdError::Params("no word".into()));
-            }
-            wordcraft_proof::add_word(&w);
-            s.relayout();
-            Ok(json!({"ignored": w}))
-        })
-        .params(r#"{"word"?: string}"#)
-        .pure(),
+        // Changes the document: its list of ignored words is saved with it.
+        CommandSpec::new("review.ignoreAll", "Ignore All", "Review › Proofing", ignore_all).params(r#"{"word"?: string}"#),
+        CommandSpec::new("review.recheckDocument", "Recheck Document", "File › Options › Proofing", recheck),
         CommandSpec::new("review.applySuggestion", "Change", "Review › Proofing", |s, v| {
             let text = p::req_str(v, "text")?.to_string();
             let at = s.sel.focus.clone();
             if let Some((a, b, _)) = issue_at(s, &at) {
+                // The end of a selection being checked stays put as the text before it changes length.
+                if let Some((_, to)) = s.proof_scope.as_mut()
+                    && to.story == b.story
+                    && to.path == b.path
+                    && b.off <= to.off
+                {
+                    to.off = to.off.saturating_sub(b.off - a.off).saturating_add(text.len());
+                }
                 s.sel = Selection { anchor: a, focus: b };
             }
             super::type_text(s, &text)?;
@@ -396,18 +386,11 @@ fn word_count(s: &mut Session, v: &Value) -> CmdResult {
     }))
 }
 
-/// Issues (spelling + grammar) in one paragraph as positions.
+/// Issues (spelling + grammar) in one paragraph as positions, in order.
 fn para_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, wordcraft_proof::Issue)> {
     let Some(p) = s.doc.para(story, path) else { return Vec::new() };
-    let text = wordcraft_layout::para::proof_text(p);
-    let mut v: Vec<wordcraft_proof::Issue> = wordcraft_proof::check_spelling(&text);
-    v.extend(wordcraft_proof::check_grammar(&text));
-    v.sort_by_key(|i| i.start);
-    v.into_iter()
-        .filter(|i| {
-            !p.run_ranges()
-                .any(|(r, c)| r.start < i.end && i.start < r.end && (c.no_proof == Some(true) || c.hidden == Some(true) || c.link.is_some()))
-        })
+    wordcraft_layout::para::paragraph_issues(&s.doc, p)
+        .into_iter()
         .map(|i| (Pos { story, path: path.clone(), off: i.start }, Pos { story, path: path.clone(), off: i.end }, i))
         .collect()
 }
@@ -419,7 +402,16 @@ fn issue_at(s: &Session, at: &Pos) -> Option<(Pos, Pos, wordcraft_proof::Issue)>
 
 fn issue_json(s: &Session, a: &Pos, b: &Pos, i: &wordcraft_proof::Issue) -> Value {
     let word = s.doc.para_at(a).and_then(|p| p.text.get(a.off..b.off)).unwrap_or("").to_string();
-    let sugg = if i.kind == wordcraft_proof::IssueKind::Spelling { wordcraft_proof::suggest(&word, 6) } else { i.suggestions.clone() };
+    let mut sugg = i.suggestions.clone();
+    if i.kind == wordcraft_proof::IssueKind::Spelling {
+        // Fixes a grammar rule had for the word come first (see `paragraph_issues`).
+        for w in wordcraft_proof::suggest(&word, 6) {
+            if !sugg.contains(&w) {
+                sugg.push(w);
+            }
+        }
+        sugg.truncate(8);
+    }
     json!({"start": pos_json(a), "end": pos_json(b), "text": word, "kind": if i.kind == wordcraft_proof::IssueKind::Spelling { "spelling" } else { "grammar" }, "message": i.message, "suggestions": sugg})
 }
 
@@ -428,21 +420,67 @@ fn issue_text(s: &Session, a: &Pos, b: &Pos) -> String {
     s.doc.para_at(a).and_then(|p| p.text.get(a.off..b.off)).unwrap_or("").to_string()
 }
 
-/// The issue was skipped with Ignore Once (and still covers the same text).
-fn ignored_once(s: &Session, a: &Pos, b: &Pos) -> bool {
-    s.proof_ignored.iter().any(|(st, path, x, y, t)| *st == a.story && *path == a.path && *x == a.off && *y == b.off && *t == issue_text(s, a, b))
-}
-
-/// Issues Spelling & Grammar walks through: everything but what was ignored once.
+/// Issues Spelling & Grammar walks through: everything but what was ignored once. Ignore Once
+/// remembers the n-th issue on the same text in the paragraph, so it holds while other words in
+/// the paragraph change.
 fn open_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, wordcraft_proof::Issue)> {
-    para_issues(s, story, path).into_iter().filter(|(a, b, _)| !ignored_once(s, a, b)).collect()
+    let all = para_issues(s, story, path);
+    if !s.proof_ignored.iter().any(|(st, p, _, _)| *st == story && p == path) {
+        return all;
+    }
+    let texts: Vec<(usize, String)> = all.iter().map(|(a, b, _)| (a.off, issue_text(s, a, b))).collect();
+    all.into_iter()
+        .filter(|(a, b, _)| {
+            let text = issue_text(s, a, b);
+            let k = occurrence(&texts, a.off, &text);
+            !s.proof_ignored.iter().any(|(st, p, t, kk)| *st == story && p == path && *t == text && *kk == k)
+        })
+        .collect()
 }
 
-/// F7: select the next issue after the selection (or the one the caret is in) and return it
-/// with suggestions. The check runs to the end of the story, then wraps around from the top
-/// back to where it started; with nothing left it reports `{"done": true}`.
-fn next_issue(s: &mut Session, _: &Value) -> CmdResult {
+/// Which occurrence of `text` an issue starting at `off` is among a paragraph's issues
+/// `(start, text)`: earlier starts with the same text (issues on one word share it).
+fn occurrence(texts: &[(usize, String)], off: usize, text: &str) -> usize {
+    let mut starts: Vec<usize> = texts.iter().filter(|(o, t)| *o < off && t == text).map(|(o, _)| *o).collect();
+    starts.dedup();
+    starts.len()
+}
+
+/// F7: select the next issue and return it with suggestions.
+///
+/// A fresh check (no `continue`) started with text selected checks only that selection and
+/// stops at its end; otherwise it runs from the caret to the end of the story, then wraps around
+/// from the top back to where it started. `continue` carries on the check in progress (the
+/// Spelling & Grammar pane passes it). With nothing left it reports `{"done": true}`.
+fn next_issue(s: &mut Session, v: &Value) -> CmdResult {
     let (first, last) = s.sel.ordered();
+    if !p::bool(v, "continue").unwrap_or(false) {
+        // The selection is what to check, unless it is the issue the last step selected.
+        let on_issue = first != last && issue_at(s, &first).is_some_and(|(a, b, _)| a == first && b == last);
+        if !on_issue {
+            s.proof_scope = (first != last && first.story == last.story).then(|| (first.clone(), last.clone()));
+        }
+    }
+    match s.proof_scope.clone() {
+        Some(scope) => next_in_selection(s, &first, &last, scope),
+        None => next_in_story(s, &first, &last),
+    }
+}
+
+/// Select an issue Spelling & Grammar found and describe it.
+fn found(s: &mut Session, a: Pos, b: Pos, i: &wordcraft_proof::Issue) -> CmdResult {
+    let mut r = issue_json(s, &a, &b, i);
+    if s.proof_scope.is_some()
+        && let Some(o) = r.as_object_mut()
+    {
+        o.insert("scope".into(), json!("selection"));
+    }
+    s.sel = Selection { anchor: a, focus: b };
+    Ok(r)
+}
+
+/// The whole story: from the start point to the end, then from the top back to it.
+fn next_in_story(s: &mut Session, first: &Pos, last: &Pos) -> CmdResult {
     let story = last.story;
     let paths = s.doc.para_paths(story);
     let (start, off) = paths.iter().position(|p| *p == last.path).map(|i| (i, last.off)).unwrap_or((0, 0));
@@ -459,13 +497,42 @@ fn next_issue(s: &mut Session, _: &Value) -> CmdResult {
             _ => true,
         });
         if let Some((a, b, i)) = hit {
-            let r = issue_json(s, &a, &b, &i);
-            s.sel = Selection { anchor: a, focus: b };
-            return Ok(r);
+            return found(s, a, b, &i);
         }
     }
     s.status = "The spelling and grammar check is complete.".into();
     Ok(json!({"done": true}))
+}
+
+/// Only the selection being checked: from the start point to the selection's end, no wrap.
+fn next_in_selection(s: &mut Session, first: &Pos, last: &Pos, (from, to): (Pos, Pos)) -> CmdResult {
+    let story = from.story;
+    let paths = s.doc.para_paths(story);
+    let index = |p: &Pos| paths.iter().position(|x| *x == p.path);
+    let (Some(fi), Some(ti)) = (index(&from), index(&to)) else {
+        // Its paragraphs are gone: check the document instead.
+        s.proof_scope = None;
+        return next_in_story(s, first, last);
+    };
+    // Look from the selection's start when the check begins, else after the issue the last step
+    // selected (or the caret).
+    let at_start = (*first == from && *last == to) || last.story != story;
+    let li = index(last).unwrap_or(fi);
+    let begin = if at_start { fi } else { li.max(fi) };
+    for i in begin..=ti {
+        let Some(path) = paths.get(i) else { break };
+        let hit = open_issues(s, story, path).into_iter().find(|(a, b, _)| {
+            let inside = (i, a.off) >= (fi, from.off) && (i, b.off) <= (ti, to.off);
+            let after = at_start || if first == last { (i, b.off) > (li, last.off) } else { (i, a.off) >= (li, last.off) };
+            inside && after
+        });
+        if let Some((a, b, iss)) = hit {
+            return found(s, a, b, &iss);
+        }
+    }
+    s.proof_scope = None;
+    s.status = "The spelling and grammar check of the selection is complete.".into();
+    Ok(json!({"done": true, "scope": "selection", "end": pos_json(&to)}))
 }
 
 /// Ignore Once: skip the issue at the selection for the rest of the session.
@@ -475,13 +542,57 @@ fn ignore_once(s: &mut Session, v: &Value) -> CmdResult {
     let at = v.get("pos").and_then(super::parse_pos).unwrap_or_else(|| s.sel.ordered().0);
     let (a, b, _) = issue_at(s, &at).ok_or_else(|| CmdError::Params("no spelling or grammar issue there".into()))?;
     let text = issue_text(s, &a, &b);
-    if !ignored_once(s, &a, &b) {
+    // Which issue on this text it is in the paragraph (see `open_issues`).
+    let texts: Vec<(usize, String)> = para_issues(s, a.story, &a.path).iter().map(|(x, y, _)| (x.off, issue_text(s, x, y))).collect();
+    let k = occurrence(&texts, a.off, &text);
+    let key = (a.story, a.path.clone(), text.clone(), k);
+    if !s.proof_ignored.contains(&key) {
         if s.proof_ignored.len() >= MAX_IGNORED {
             s.proof_ignored.remove(0);
         }
-        s.proof_ignored.push((a.story, a.path.clone(), a.off, b.off, text.clone()));
+        s.proof_ignored.push(key);
     }
     Ok(json!({"ignored": text}))
+}
+
+/// The word a proofing command acts on: `word`, or the text of the issue at the selection.
+fn issue_word(s: &Session, v: &Value) -> Result<String, CmdError> {
+    let w = match p::str(v, "word") {
+        Some(w) => w.trim().to_string(),
+        None => issue_at(s, &s.sel.focus).map(|(a, b, _)| issue_text(s, &a, &b)).unwrap_or_default(),
+    };
+    if w.is_empty() {
+        return Err(CmdError::Params("no word".into()));
+    }
+    Ok(w)
+}
+
+/// Ignore All: this word is skipped everywhere in this document. The list is saved with the
+/// document (a custom property), so it is still ignored after reopening; Recheck Document
+/// clears it. Unlike Add to Dictionary, other documents still flag it.
+fn ignore_all(s: &mut Session, v: &Value) -> CmdResult {
+    /// The longest list kept (bytes), so a script can't bloat the document's properties.
+    const MAX_LIST: usize = 64 * 1024;
+    let w = issue_word(s, v)?;
+    if w.contains(char::is_whitespace) {
+        return Err(CmdError::Params("Ignore All takes a single word".into()));
+    }
+    let list = wordcraft_proof::with_ignored(s.doc.custom_prop(wordcraft_proof::IGNORED_WORDS_PROP).unwrap_or(""), &w);
+    if list.len() > MAX_LIST || !wordcraft_proof::is_ignored(&list, &w) {
+        return Err(CmdError::Failed("this document's list of ignored words is full".into()));
+    }
+    s.doc.set_custom_prop(wordcraft_proof::IGNORED_WORDS_PROP, &list);
+    s.relayout();
+    Ok(json!({"ignored": w}))
+}
+
+/// Recheck Document: forget everything ignored in this document (Ignore Once and Ignore All).
+fn recheck(s: &mut Session, _: &Value) -> CmdResult {
+    s.proof_ignored.clear();
+    s.proof_scope = None;
+    let words = s.doc.remove_custom_prop(wordcraft_proof::IGNORED_WORDS_PROP);
+    s.relayout();
+    Ok(json!({"rechecked": true, "ignoredWordsCleared": words}))
 }
 
 fn all_issues(s: &mut Session, _: &Value) -> CmdResult {

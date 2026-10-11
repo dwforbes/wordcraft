@@ -298,10 +298,23 @@ fn proofing(app: &mut WordApp, ui: &mut Ui) {
         return;
     }
     let t = Tokens::get(ui.ctx());
+    let selection = str_of("scope") == "selection";
     if done {
-        ui.label(tl!("The spelling and grammar check is complete."));
+        ui.label(if selection {
+            tl!("The spelling and grammar check of the selection is complete.")
+        } else {
+            tl!("The spelling and grammar check is complete.")
+        });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Like Word's "continue checking the remainder of the document?".
+            if selection
+                && let Some(end) = issue.get("end").cloned()
+                && ui.button(tl!("Check Rest of Document")).clicked()
+            {
+                let _ = app.run("caret.set", json!({"pos": end}));
+                let _ = app.run("review.spelling", json!({}));
+            }
             if ui.button(tl!("Check Again")).clicked() {
                 let _ = app.run("caret.docStart", json!({}));
                 let _ = app.run("review.spelling", json!({}));
@@ -311,6 +324,9 @@ fn proofing(app: &mut WordApp, ui: &mut Ui) {
             }
         });
         return;
+    }
+    if selection {
+        ui.label(egui::RichText::new(tl!("Checking the selection")).small().color(t.accent_text));
     }
     ui.label(egui::RichText::new(str_of("message")).small().color(t.text_dim));
     ui.add_space(4.0);
@@ -341,17 +357,17 @@ fn proofing(app: &mut WordApp, ui: &mut Ui) {
             proof_act(app, &issue, "review.ignoreOnce", json!({}));
         }
         if spelling {
-            if ui.button(tl!("Ignore All")).clicked() {
+            if ui.button(tl!("Ignore All")).on_hover_text(tl!("Ignore this word everywhere in this document")).clicked() {
                 proof_act(app, &issue, "review.ignoreAll", json!({}));
             }
-            if ui.button(tl!("Add to Dictionary")).clicked() {
+            if ui.button(tl!("Add to Dictionary")).on_hover_text(tl!("Accept this word in every document")).clicked() {
                 proof_act(app, &issue, "review.addToDictionary", json!({}));
             }
         }
     });
 }
 
-/// Act on the pane's issue and move on to the next one. If the document changed under the pane
+/// Act on the pane's issue and move on to the next one (within the selection being checked). If the document changed under the pane
 /// and the issue is no longer there, look again from where it was instead.
 pub(crate) fn proof_act(app: &mut WordApp, issue: &Value, id: &str, params: Value) {
     let (Some(start), Some(end)) = (issue.get("start").cloned(), issue.get("end").cloned()) else { return };
@@ -359,10 +375,10 @@ pub(crate) fn proof_act(app: &mut WordApp, issue: &Value, id: &str, params: Valu
     let same = now.get("start") == Some(&start) && now.get("end") == Some(&end) && now.get("text") == issue.get("text");
     if !same {
         let _ = app.run("caret.set", json!({"pos": start}));
-        let _ = app.run("review.spelling", json!({}));
+        let _ = app.run("review.spelling", json!({"continue": true}));
         return;
     }
     let _ = app.run("select.range", json!({"anchor": start, "focus": end}));
     let _ = app.run(id, params);
-    let _ = app.run("review.spelling", json!({}));
+    let _ = app.run("review.spelling", json!({"continue": true}));
 }

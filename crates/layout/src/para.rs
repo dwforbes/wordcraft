@@ -872,7 +872,7 @@ pub fn layout_para(p: &Paragraph, env: &ParaEnv) -> ParaLayout {
         text_len: p.text.len(),
         has_page_fields,
         notes,
-        issues: if env.proofing { proof_issues(p) } else { Vec::new() },
+        issues: if env.proofing { proof_issues(env.doc, p) } else { Vec::new() },
         drop_cap,
         hyph_after: Vec::new(),
         bidi_levels: b.levels,
@@ -1764,8 +1764,9 @@ impl ParaLayout {
     }
 }
 
-/// Spelling and grammar issues in a paragraph (skipping "do not check" and hidden runs).
-fn proof_issues(p: &Paragraph) -> Vec<(usize, usize, bool)> {
+/// Spelling and grammar issues in a paragraph, in order: skips "do not check", hidden and linked
+/// text, and the document's Ignore All words (whatever flags them). The squiggles and Spelling & Grammar both use it.
+pub fn paragraph_issues(doc: &Document, p: &Paragraph) -> Vec<wordcraft_proof::Issue> {
     if p.text.trim().is_empty() || p.text.len() > 100_000 {
         return Vec::new();
     }
@@ -1773,10 +1774,24 @@ fn proof_issues(p: &Paragraph) -> Vec<(usize, usize, bool)> {
     let skip = |a: usize, b: usize| {
         p.run_ranges().any(|(r, c)| r.start < b && a < r.end && (c.no_proof == Some(true) || c.hidden == Some(true) || c.link.is_some()))
     };
-    let mut v: Vec<(usize, usize, bool)> =
-        wordcraft_proof::check_spelling(&text).into_iter().filter(|i| !skip(i.start, i.end)).map(|i| (i.start, i.end, false)).collect();
-    v.extend(wordcraft_proof::check_grammar(&text).into_iter().filter(|i| !skip(i.start, i.end)).map(|i| (i.start, i.end, true)));
+    let ignored = doc.custom_prop(wordcraft_proof::IGNORED_WORDS_PROP).unwrap_or("");
+    let mut v: Vec<wordcraft_proof::Issue> = wordcraft_proof::check_spelling(&text);
+    // A grammar issue on exactly a misspelled word (Harper's "photocraft → photo craft") is the
+    // same problem: one issue, its fixes first among the suggestions.
+    for g in wordcraft_proof::check_grammar(&text) {
+        match v.iter_mut().find(|i| i.kind == wordcraft_proof::IssueKind::Spelling && i.start == g.start && i.end == g.end) {
+            Some(sp) => sp.suggestions.extend(g.suggestions),
+            None => v.push(g),
+        }
+    }
+    v.retain(|i| !skip(i.start, i.end) && (ignored.is_empty() || !text.get(i.start..i.end).is_some_and(|w| wordcraft_proof::is_ignored(ignored, w))));
+    v.sort_by_key(|i| i.start);
     v
+}
+
+/// The squiggles: (start, end, grammar).
+fn proof_issues(doc: &Document, p: &Paragraph) -> Vec<(usize, usize, bool)> {
+    paragraph_issues(doc, p).into_iter().map(|i| (i.start, i.end, i.kind == wordcraft_proof::IssueKind::Grammar)).collect()
 }
 
 /// Text for proofing with the same byte offsets: inline objects and tracked deletions become
