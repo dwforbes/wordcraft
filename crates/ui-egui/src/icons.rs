@@ -1093,6 +1093,15 @@ pub fn paint(p: &Painter, r: Rect, name: &str, c: Color32, accent: Color32) {
             pen.fcircle(7.5, 10.5, 1.5, Color32::WHITE);
             pen.fcircle(12.5, 10.5, 1.5, Color32::WHITE);
         }
+        "memory" => {
+            // A memory chip: a package with pins down both sides.
+            pen.rect(6.0, 3.5, 14.0, 16.5, c);
+            pen.frect(8.0, 6.0, 12.0, 9.0, a);
+            for y in [6.0, 9.0, 12.0, 15.0] {
+                pen.line(&[(3.5, y), (6.0, y)]);
+                pen.line(&[(14.0, y), (16.5, y)]);
+            }
+        }
         "help" => {
             pen.circle(10.0, 10.0, 7.0, c);
             pen.text(10.0, 10.0, 10.0, "?", a, true);

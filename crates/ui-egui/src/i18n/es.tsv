@@ -906,3 +906,23 @@
 	The spelling and grammar check of the selection is complete.	La revisión ortográfica y gramatical de la selección ha terminado.
 	Ignore this word everywhere in this document	Omitir esta palabra en todo este documento
 	Accept this word in every document	Aceptar esta palabra en todos los documentos
+	Memory Usage	Uso de memoria
+	Memory\nUsage	Uso de\nmemoria
+	Release Memory	Liberar memoria
+	Diagnostics	Diagnóstico
+	Items	Elementos
+	Page images	Imágenes de página
+	Document pictures	Imágenes del documento
+	Undo history	Historial de deshacer
+	Decoded pictures	Imágenes descodificadas
+	Grammar checker	Corrector gramatical
+	WordCraft in total	WordCraft en total
+	Pages drawn for the screen. Only pages on or near the screen are kept.	Páginas dibujadas para la pantalla. Solo se conservan las páginas visibles o cercanas.
+	Pictures in the document, as stored in the file.	Imágenes del documento, tal como se guardan en el archivo.
+	Steps you can undo or redo. The size is pictures only the history still needs.	Pasos que puede deshacer o rehacer. El tamaño corresponde a imágenes que solo el historial necesita.
+	Pictures unpacked for drawing. At most 256 MB; the least recently used go first.	Imágenes descomprimidas para dibujarlas. Como máximo 256 MB; se descartan primero las menos usadas recientemente.
+	Font files read from disk. Built-in fonts are part of the program.	Archivos de fuentes leídos del disco. Las fuentes integradas forman parte del programa.
+	Rules, dictionary and language models, loaded on the first spelling and grammar check.	Reglas, diccionario y modelos de idioma, cargados en la primera revisión ortográfica y gramatical.
+	Paragraph layouts kept so edits redraw quickly.	Diseños de párrafo guardados para que las ediciones se redibujen rápido.
+	Everything WordCraft holds in memory, including the program, the window and the system's buffers.	Todo lo que WordCraft tiene en memoria, incluidos el programa, la ventana y los búferes del sistema.
+	Let go of caches that are rebuilt when needed. Your document and undo history are kept.	Libera las cachés que se reconstruyen cuando hacen falta. Se conservan el documento y el historial de deshacer.

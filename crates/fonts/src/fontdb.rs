@@ -214,6 +214,16 @@ struct CatalogEntry {
     path: std::path::PathBuf,
 }
 
+/// What [`FontDb::usage`] reports.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FontUsage {
+    pub faces: usize,
+    /// Font files read from disk, and their bytes.
+    pub files: usize,
+    pub file_bytes: usize,
+    pub outlines: usize,
+}
+
 /// Process-wide font database.
 pub struct FontDb {
     faces: RwLock<Vec<Arc<FontFace>>>,
@@ -291,6 +301,86 @@ const SYSTEM_FALLBACKS: &[&str] = &[
     "Apple Color Emoji",
     "Noto Color Emoji",
 ];
+
+/// Does a face in the font file at `p` map `c`? Reads only the character maps, not the file.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_covers(p: &std::path::Path, c: char) -> bool {
+    use skrifa::raw::FontRead;
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_FACES: usize = 256;
+    const MAX_CMAP: u32 = 16 << 20;
+    let Ok(mut file) = std::fs::File::open(p) else { return false };
+    let mut read_at = |offset: u64, len: usize| -> Option<Vec<u8>> {
+        let mut buf = vec![0; len];
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    let be16 = |b: &[u8], at: usize| b.get(at..at + 2).and_then(|s| s.try_into().ok()).map(u16::from_be_bytes);
+    let be32 = |b: &[u8], at: usize| b.get(at..at + 4).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes);
+    let Some(head) = read_at(0, 12) else { return false };
+    let starts: Vec<u32> = if head.starts_with(b"ttcf") {
+        let n = (be32(&head, 8).unwrap_or(0) as usize).min(MAX_FACES);
+        read_at(12, n * 4).map(|b| b.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c)).collect()).unwrap_or_default()
+    } else {
+        vec![0]
+    };
+    let mut seen = std::collections::HashSet::new();
+    starts.into_iter().any(|start| {
+        let Some(dir) = read_at(start.into(), 12) else { return false };
+        let tables = usize::from(be16(&dir, 4).unwrap_or(0)).min(512);
+        let Some(recs) = read_at(u64::from(start) + 12, tables * 16) else { return false };
+        let Some((off, len)) = recs.as_chunks::<16>().0.iter().find(|r| r.starts_with(b"cmap")).and_then(|r| Some((be32(r, 8)?, be32(r, 12)?)))
+        else {
+            return false;
+        };
+        // Faces of a collection often share one character map.
+        if len > MAX_CMAP || !seen.insert(off) {
+            return false;
+        }
+        read_at(off.into(), len as usize)
+            .is_some_and(|b| skrifa::raw::tables::cmap::Cmap::read(skrifa::raw::FontData::new(&b)).is_ok_and(|cmap| cmap.map_codepoint(c).is_some()))
+    })
+}
+
+/// Bitmap glyph tables. Pages are drawn from outlines, so their glyphs would show as nothing.
+const BITMAP_TABLES: [&[u8; 4]; 4] = [b"sbix", b"CBDT", b"EBDT", b"bdat"];
+
+/// A font file's bytes, unless it is mostly bitmap glyphs (Apple Color Emoji: 190 MB of
+/// pictures that would render blank). Decided from the table directory before reading it all.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_font_file(p: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(p).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).ok()?;
+    let be32 = |b: &[u8]| b.get(..4).and_then(|x| x.try_into().ok()).map(u32::from_be_bytes);
+    // A collection's first face describes the file well enough.
+    let dir = if &head[..4] == b"ttcf" { u64::from(be32(&head[12..])?) } else { 0 };
+    f.seek(SeekFrom::Start(dir)).ok()?;
+    let mut d = [0u8; 12];
+    f.read_exact(&mut d).ok()?;
+    let tables = usize::from(u16::from_be_bytes([d[4], d[5]])).min(512);
+    let mut recs = vec![0u8; tables * 16];
+    f.read_exact(&mut recs).ok()?;
+    let bitmap: u64 = recs
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .filter(|r| BITMAP_TABLES.iter().any(|t| r.get(..4) == Some(&t[..])))
+        .filter_map(|r| be32(&r[12..]))
+        .map(u64::from)
+        .sum();
+    if bitmap > len / 2 {
+        log::debug!("skipped bitmap font {}", p.display());
+        return None;
+    }
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut data = Vec::with_capacity(usize::try_from(len).ok()?.min(1 << 30));
+    f.read_to_end(&mut data).ok()?;
+    Some(data)
+}
 
 /// Arabic-script marks and digits (bidi classes NSM / AN): they belong with the Arabic letters
 /// around them when choosing a fallback font.
@@ -711,6 +801,13 @@ impl FontDb {
     /// Load the files of the installed `family`. Returns whether any face was added.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) -> bool {
+        self.load_cataloged_if(family, |_| true)
+    }
+
+    /// Load the files of the installed `family` if `keep` accepts one of their paths (all or
+    /// none, so the family's styles stay together). Returns whether any face was added.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_cataloged_if(&self, family: &str, keep: impl Fn(&std::path::Path) -> bool) -> bool {
         let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
         // Another lookup may have loaded it while this one waited.
         if self.is_loaded(family) {
@@ -723,8 +820,11 @@ impl FontDb {
             p.dedup();
             p
         };
-        let files = paths.iter().filter_map(|p| std::fs::read(p).ok()).collect();
-        self.add_fonts(files) > 0
+        if !paths.iter().any(|p| keep(p)) {
+            return false;
+        }
+        let files: Vec<Vec<u8>> = paths.iter().filter_map(|p| read_font_file(p)).collect();
+        !files.is_empty() && self.add_fonts(files) > 0
     }
 
     /// Resolve a family + style to a face, falling back to the closest style of the family, then to
@@ -896,8 +996,10 @@ impl FontDb {
         let rtl = crate::is_rtl(c) || arabic_block(c);
         let preferred = RTL_FALLBACKS.iter().filter(|_| rtl);
         for fam in preferred.chain(SYSTEM_FALLBACKS.iter()) {
+            // Only a family that has the character stays loaded: the others are read, checked
+            // and let go (CJK families are tens of megabytes each).
             if !self.is_loaded(fam) && cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
-                self.load_cataloged(fam);
+                self.load_cataloged_if(fam, |p| file_covers(p, c));
                 if covered(self) {
                     return true;
                 }
@@ -910,15 +1012,38 @@ impl FontDb {
             if std::fs::metadata(&p).map(|m| m.len() > 40 << 20).unwrap_or(true) {
                 continue;
             }
-            let Ok(data) = std::fs::read(&p) else { continue };
-            let hit =
-                enumerate_faces(&data).iter().any(|(i, _, _, _)| skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some()));
-            if hit && self.add_font(data) > 0 && covered(self) {
+            if !file_covers(&p, c) {
+                continue;
+            }
+            let Some(data) = read_font_file(&p) else { continue };
+            if self.add_font(data) > 0 && covered(self) {
                 return true;
             }
         }
         self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);
         false
+    }
+
+    /// Memory held: loaded faces, the bytes of the font files read from disk (built-in fonts
+    /// are part of the program), and cached glyph outlines.
+    pub fn usage(&self) -> FontUsage {
+        let faces = self.read_faces();
+        let mut files = std::collections::HashSet::new();
+        let mut file_bytes = 0usize;
+        for f in faces.iter() {
+            if let FontBytes::Owned(d) = &f.bytes
+                && files.insert(Arc::as_ptr(d) as usize)
+            {
+                file_bytes = file_bytes.saturating_add(d.len());
+            }
+        }
+        let outlines = self.outlines.lock().unwrap_or_else(|e| e.into_inner()).len();
+        FontUsage { faces: faces.len(), files: files.len(), file_bytes, outlines }
+    }
+
+    /// Forget cached glyph outlines (they are rebuilt as glyphs are drawn).
+    pub fn clear_outlines(&self) {
+        self.outlines.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Glyph outline in font units, y-down (flipped), cached per (face, glyph).

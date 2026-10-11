@@ -33,6 +33,7 @@ from a signed download, without losing work.
 | Comments in margin balloons, track changes | done |
 | Never-crash standard (no panics, hostile-param fuzzing, panic guard) | done |
 | Autosave and crash recovery | done; needs a soak test |
+| Memory: report (Help › Memory Usage, `tools.memoryUsage`) and bounded caches (page images near the view only, decoded pictures ≤ 256 MB, fallback fonts kept only when they have the character, bitmap-only fonts skipped) | done; the grammar checker is a fixed ~130 MB once loaded |
 | **DOCX fidelity against a corpus of real-world files** (open, render, round-trip, fix) | **not started — the main alpha blocker (≈10 h)** |
 | Footnotes that continue onto the next page; column balancing | missing (≈4 h) |
 | Native printing (today printing goes through PDF) | missing (≈4 h) |

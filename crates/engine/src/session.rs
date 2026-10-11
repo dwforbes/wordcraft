@@ -344,6 +344,53 @@ impl Session {
         self.cache.clear();
     }
 
+    /// What the session's caches and history hold, for the memory report: `{"resident"?: bytes,
+    /// "items": [{"name", "count", "bytes"?, "note"}]}`. Sizes are what each part holds itself;
+    /// the program, the window and the system's own buffers make up the rest of the process.
+    pub fn memory_report(&self) -> serde_json::Value {
+        use serde_json::json;
+        let media_bytes = |m: &std::collections::BTreeMap<String, Arc<Vec<u8>>>| m.values().map(|d| d.len()).fold(0usize, usize::saturating_add);
+        // Pictures only the undo history still holds (unchanged ones are shared, not copied).
+        let mut seen: std::collections::HashSet<usize> = self.doc.media.values().map(|d| Arc::as_ptr(d) as usize).collect();
+        let mut undo_bytes = 0usize;
+        for u in self.history.iter().chain(&self.redo) {
+            for d in u.doc.media.values() {
+                if seen.insert(Arc::as_ptr(d) as usize) {
+                    undo_bytes = undo_bytes.saturating_add(d.len());
+                }
+            }
+        }
+        let (pics, pic_bytes) = wordcraft_render::image_cache_usage();
+        let fonts = wordcraft_fonts::FontDb::global().usage();
+        let g = wordcraft_proof::harper::usage();
+        let items = vec![
+            json!({"name": "Document pictures", "count": self.doc.media.len(), "bytes": media_bytes(&self.doc.media), "note": "Pictures in the document, as stored in the file"}),
+            json!({"name": "Undo history", "count": self.history.len() + self.redo.len(), "bytes": undo_bytes, "note": "Steps you can undo or redo; bytes are pictures only the history still needs"}),
+            json!({"name": "Decoded pictures", "count": pics, "bytes": pic_bytes, "note": "Pictures unpacked for drawing (at most 256 MB, least recently used dropped first)"}),
+            json!({"name": "Fonts", "count": fonts.files, "bytes": fonts.file_bytes, "faces": fonts.faces, "glyphShapes": fonts.outlines, "note": "Font files read from disk; built-in fonts are part of the program"}),
+            json!({"name": "Grammar checker", "count": g.cached, "bytes": g.load_bytes.saturating_add(g.cache_bytes), "note": if g.loaded {
+                "Rules, dictionary and language models (loaded on the first spelling and grammar check), plus results for the paragraphs counted"
+            } else {
+                "Not loaded yet (it loads on the first spelling and grammar check)"
+            }}),
+            json!({"name": "Layout", "count": self.cache.len(), "bytes": null, "pages": self.layout.as_ref().map_or(0, |l| l.3.pages.len()), "note": "Paragraph layouts kept so edits redraw quickly"}),
+        ];
+        #[cfg(not(target_arch = "wasm32"))]
+        let resident = memory_stats::memory_stats().map(|m| m.physical_mem);
+        #[cfg(target_arch = "wasm32")]
+        let resident: Option<usize> = None;
+        json!({"resident": resident, "items": items})
+    }
+
+    /// Let go of caches that are rebuilt on demand: decoded pictures, glyph shapes, grammar
+    /// results and paragraph layouts. The document and its undo history are untouched.
+    pub fn release_memory(&mut self) {
+        wordcraft_render::clear_image_cache();
+        wordcraft_fonts::FontDb::global().clear_outlines();
+        wordcraft_proof::harper::clear_cache();
+        self.cache = LayoutCache::new();
+    }
+
     /// Snapshot for undo before a change.
     pub fn checkpoint(&mut self, label: &str) {
         if label == "Typing" && self.typing_open {

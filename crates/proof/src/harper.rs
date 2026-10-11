@@ -31,7 +31,18 @@ struct State {
     cache_bytes: usize,
 }
 
+/// Resident memory the last start of Harper added (native; 0 when unknown).
+static LOAD_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn resident() -> Option<usize> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return memory_stats::memory_stats().map(|m| m.physical_mem);
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
 fn build() -> Option<LintGroup> {
+    let before = resident();
     let built = std::panic::catch_unwind(|| {
         let mut g = LintGroup::new_curated(FstDictionary::curated(), Dialect::American);
         g.config.set_rule_enabled("SpellCheck", false);
@@ -40,12 +51,50 @@ fn build() -> Option<LintGroup> {
     if built.is_err() {
         log::error!("Harper failed to start; grammar falls back to the built-in checks");
     }
+    // Other threads allocate meanwhile, so this is an estimate.
+    if let (Some(a), Some(b)) = (before, resident()) {
+        LOAD_BYTES.store(b.saturating_sub(a), std::sync::atomic::Ordering::Relaxed);
+    }
     built.ok()
 }
 
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
 fn state() -> &'static Mutex<State> {
-    static S: OnceLock<Mutex<State>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(State { group: build(), rebuilds: 0, cache: HashMap::new(), cache_bytes: 0 }))
+    STATE.get_or_init(|| Mutex::new(State { group: build(), rebuilds: 0, cache: HashMap::new(), cache_bytes: 0 }))
+}
+
+/// Grammar checker memory.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub loaded: bool,
+    /// Resident memory starting it took (estimated; 0 when unknown).
+    pub load_bytes: usize,
+    /// Paragraphs with cached results, and the bytes of their text.
+    pub cached: usize,
+    pub cache_bytes: usize,
+}
+
+/// What the grammar checker holds.
+pub fn usage() -> Usage {
+    // Not started yet: don't start it just to report on it.
+    let Some(st) = STATE.get() else { return Usage::default() };
+    let st = st.lock().unwrap_or_else(|e| e.into_inner());
+    Usage {
+        loaded: st.group.is_some(),
+        load_bytes: if st.group.is_some() { LOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) } else { 0 },
+        cached: st.cache.len(),
+        cache_bytes: st.cache_bytes,
+    }
+}
+
+/// Forget cached results (the checker itself stays loaded).
+pub fn clear_cache() {
+    if let Some(st) = STATE.get() {
+        let mut st = st.lock().unwrap_or_else(|e| e.into_inner());
+        st.cache.clear();
+        st.cache_bytes = 0;
+    }
 }
 
 /// Harper's issues in a paragraph of text, as byte ranges. Empty if Harper is unavailable.

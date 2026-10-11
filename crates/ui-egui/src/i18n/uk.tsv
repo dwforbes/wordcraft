@@ -901,3 +901,23 @@
 	The spelling and grammar check of the selection is complete.	Перевірку орфографії та граматики виділеного завершено.
 	Ignore this word everywhere in this document	Пропускати це слово в усьому документі
 	Accept this word in every document	Приймати це слово в усіх документах
+	Memory Usage	Використання пам’яті
+	Memory\nUsage	Використання\nпам’яті
+	Release Memory	Звільнити пам’ять
+	Diagnostics	Діагностика
+	Items	Елементів
+	Page images	Зображення сторінок
+	Document pictures	Зображення документа
+	Undo history	Історія скасування
+	Decoded pictures	Розпаковані зображення
+	Grammar checker	Перевірка граматики
+	WordCraft in total	WordCraft загалом
+	Pages drawn for the screen. Only pages on or near the screen are kept.	Сторінки, намальовані для екрана. Зберігаються лише сторінки на екрані або поруч.
+	Pictures in the document, as stored in the file.	Зображення в документі в тому вигляді, як вони збережені у файлі.
+	Steps you can undo or redo. The size is pictures only the history still needs.	Кроки, які можна скасувати або повторити. Розмір — це зображення, потрібні лише історії.
+	Pictures unpacked for drawing. At most 256 MB; the least recently used go first.	Зображення, розпаковані для малювання. Не більше 256 МБ; першими видаляються ті, що давно не використовувалися.
+	Font files read from disk. Built-in fonts are part of the program.	Файли шрифтів, прочитані з диска. Вбудовані шрифти є частиною програми.
+	Rules, dictionary and language models, loaded on the first spelling and grammar check.	Правила, словник і мовні моделі, що завантажуються під час першої перевірки правопису й граматики.
+	Paragraph layouts kept so edits redraw quickly.	Макети абзаців, збережені, щоб зміни швидко перемальовувалися.
+	Everything WordCraft holds in memory, including the program, the window and the system's buffers.	Усе, що WordCraft тримає в пам’яті, зокрема програма, вікно та системні буфери.
+	Let go of caches that are rebuilt when needed. Your document and undo history are kept.	Звільняє кеші, які за потреби створюються знову. Документ та історія скасування зберігаються.

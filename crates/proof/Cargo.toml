@@ -17,6 +17,10 @@ harper-core = { version = "2.11", default-features = false, features = ["concurr
 [dev-dependencies]
 proptest = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# How much memory starting Harper took, for the memory report.
+memory-stats = "1.2"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # For Harper on the web; see .cargo/config.toml.
 getrandom = { version = "0.3", features = ["wasm_js"] }

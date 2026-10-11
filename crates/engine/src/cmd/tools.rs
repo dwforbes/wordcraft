@@ -72,6 +72,12 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .params(r#"{"name"?: string} (call again to stop)"#)
         .pure(),
+        CommandSpec::new("tools.memoryUsage", "Memory Usage", "Help › Diagnostics", |s, _| Ok(s.memory_report())).pure(),
+        CommandSpec::new("tools.releaseMemory", "Release Memory", "Help › Diagnostics", |s, _| {
+            s.release_memory();
+            Ok(s.memory_report())
+        })
+        .pure(),
         CommandSpec::new("tools.macros", "Macros", "View › Macros", macros)
             .params(r#"{"run"?: name, "define"?: {"name": string, "steps": [{"command", "params"}]}, "delete"?: name}"#)
             .pure(),

@@ -11,7 +11,7 @@ mod fontdb;
 pub mod math;
 pub mod word;
 
-pub use fontdb::{FALLBACK_FAMILY, FaceRef, FontDb, FontFace, base_style, bundled, system_font_dirs};
+pub use fontdb::{FALLBACK_FAMILY, FaceRef, FontDb, FontFace, FontUsage, base_style, bundled, system_font_dirs};
 pub use harfrust::Feature;
 use harfrust::{Direction, ShapeOptions, Tag, UnicodeBuffer};
 pub use kurbo::BezPath;

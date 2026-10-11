@@ -51,6 +51,17 @@ impl CanvasState {
     pub(crate) fn page_texture(&self, page: usize) -> Option<&TextureHandle> {
         self.textures.get(&page).map(|(_, t)| t)
     }
+
+    /// Drop every page rendering (pages are drawn again as they come into view).
+    pub(crate) fn release_textures(&mut self) {
+        self.textures.clear();
+    }
+
+    /// Page renderings held: (count, bytes).
+    pub(crate) fn texture_usage(&self) -> (usize, usize) {
+        let bytes = self.textures.values().map(|(_, t)| t.size().iter().product::<usize>().saturating_mul(4)).fold(0usize, usize::saturating_add);
+        (self.textures.len(), bytes)
+    }
 }
 
 impl Default for CanvasState {
@@ -242,6 +253,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let mut rendered = 0;
         let t0 = crate::now_ms();
         let mut rects = Vec::with_capacity(geo.rects.len());
+        // Pages within a screen of the view keep their rendering; the rest give it back (a page
+        // is 14 MB at 100% on a 2× display, 55 MB at 200%).
+        let keep_rect = ui.clip_rect().expand2(vec2(0.0, ui.clip_rect().height().max(200.0)));
+        let mut keep: Vec<usize> = Vec::new();
         let content_origin = ui.min_rect().min;
         for (i, pr) in geo.rects.iter().enumerate() {
             let sr = pr.translate(content_origin.to_vec2());
@@ -256,6 +271,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 sr
             };
             rects.push(visual_sr);
+            if sr.intersects(keep_rect) {
+                keep.push(i);
+            }
             if !sr.intersects(ui.clip_rect().expand(200.0)) {
                 continue;
             }
@@ -322,9 +340,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         if rendered > 0 {
             app.canvas.render_ms = crate::now_ms() - t0;
         }
-        // Drop textures of pages that no longer exist.
-        let n = layout.pages.len();
-        app.canvas.textures.retain(|k, _| *k < n);
+        // Drop textures of pages far from the view and of pages that no longer exist.
+        app.canvas.textures.retain(|k, _| keep.binary_search(k).is_ok());
         app.canvas.page_rects = rects.clone();
         balloons(app, ui, &painter, &rects, &layout, geo.scale);
         // Selection (a selected object shows its frame instead).

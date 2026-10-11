@@ -151,3 +151,50 @@ fn the_scan_reads_names_without_loading_the_font() {
     assert!(file_face_names(&dir.join("readme.txt")).is_empty());
     assert!(file_face_names(&dir.join("missing.ttf")).is_empty());
 }
+
+#[test]
+fn coverage_is_read_from_the_character_map_alone() {
+    let dir = font_dir("covers");
+    let regular = dir.join("Sysfont-Regular.ttf");
+    assert!(file_covers(&regular, 'A'));
+    assert!(!file_covers(&regular, '中'));
+    assert!(!file_covers(&dir.join("damaged.ttf"), 'A'));
+    assert!(!file_covers(&dir.join("readme.txt"), 'A'));
+    assert!(!file_covers(&dir.join("missing.ttf"), 'A'));
+    let ttc = dir.join("Sysfont.ttc");
+    std::fs::write(&ttc, collection(&[renamed("SourceSans3-Regular.ttf"), renamed("SourceSans3-Bold.ttf")])).unwrap();
+    assert!(file_covers(&ttc, 'é'));
+}
+
+#[test]
+fn bitmap_fonts_are_not_read() {
+    // Pages are drawn from outlines: a font that is mostly bitmap glyphs (like Apple Color
+    // Emoji, 190 MB) would cost its size and draw nothing.
+    let dir = font_dir("bitmap");
+    let mut f = Vec::new();
+    f.extend(0x0001_0000u32.to_be_bytes());
+    f.extend(1u16.to_be_bytes());
+    f.extend([0u8; 6]);
+    f.extend(b"sbix");
+    f.extend(0u32.to_be_bytes());
+    f.extend(28u32.to_be_bytes());
+    f.extend(1000u32.to_be_bytes());
+    f.extend(vec![0u8; 1000]);
+    let p = dir.join("Bitmap.ttf");
+    std::fs::write(&p, &f).unwrap();
+    assert!(read_font_file(&p).is_none());
+    assert!(read_font_file(&dir.join("Sysfont-Regular.ttf")).is_some_and(|d| d.len() > 1000));
+    assert!(read_font_file(&dir.join("damaged.ttf")).is_none());
+}
+
+#[test]
+fn a_fallback_search_keeps_only_fonts_that_have_the_character() {
+    let db = FontDb::with_font_dirs(vec![font_dir("fallback")]);
+    // The installed font lacks it: it is checked, not loaded.
+    assert!(db.fallback_for('中', u32::MAX).is_none_or(|f| f.family != FAMILY));
+    assert_eq!(db.usage().files, 0, "{:?}", db.usage());
+    assert!(!db.is_loaded(FAMILY));
+    // Loading by name still reads it.
+    assert_eq!(db.face(FAMILY, "Regular").family, FAMILY);
+    assert_eq!(db.usage().files, 2, "the family's files load together");
+}

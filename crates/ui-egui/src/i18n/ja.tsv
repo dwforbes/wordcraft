@@ -889,3 +889,23 @@
 	The spelling and grammar check of the selection is complete.	選択範囲のスペルと文法のチェックが終わりました。
 	Ignore this word everywhere in this document	この文書ではこの単語をすべて無視
 	Accept this word in every document	すべての文書でこの単語を正しいとする
+	Memory Usage	メモリ使用量
+	Memory\nUsage	メモリ\n使用量
+	Release Memory	メモリを解放
+	Diagnostics	診断
+	Items	項目数
+	Page images	ページ画像
+	Document pictures	文書内の画像
+	Undo history	元に戻す履歴
+	Decoded pictures	展開済みの画像
+	Grammar checker	文法チェッカー
+	WordCraft in total	WordCraft 全体
+	Pages drawn for the screen. Only pages on or near the screen are kept.	画面表示用に描画したページです。画面上またはその近くのページだけを保持します。
+	Pictures in the document, as stored in the file.	文書内の画像です (ファイルに保存されている形式)。
+	Steps you can undo or redo. The size is pictures only the history still needs.	元に戻す・やり直しできる操作です。サイズは履歴だけが必要としている画像の分です。
+	Pictures unpacked for drawing. At most 256 MB; the least recently used go first.	描画のために展開した画像です。最大 256 MB で、最近使っていないものから破棄します。
+	Font files read from disk. Built-in fonts are part of the program.	ディスクから読み込んだフォント ファイルです。内蔵フォントはプログラムの一部です。
+	Rules, dictionary and language models, loaded on the first spelling and grammar check.	規則、辞書、言語モデルです。最初のスペル チェックと文章校正で読み込まれます。
+	Paragraph layouts kept so edits redraw quickly.	編集をすばやく再描画するために保持している段落のレイアウトです。
+	Everything WordCraft holds in memory, including the program, the window and the system's buffers.	プログラム、ウィンドウ、システムのバッファーを含め、WordCraft がメモリに保持しているすべてです。
+	Let go of caches that are rebuilt when needed. Your document and undo history are kept.	必要に応じて作り直せるキャッシュを解放します。文書と元に戻す履歴はそのまま残ります。

@@ -1031,6 +1031,9 @@ fn help(app: &mut WordApp, ui: &mut Ui) {
         big(ui, app, "help", "Help", "ui.dialog", json!({"name": "about"}), false);
         big(ui, app, "discord", "Community\nDiscord", "ui.discord", json!({}), false);
     });
+    group(ui, "Diagnostics", None, app, |ui, app| {
+        big(ui, app, "memory", "Memory\nUsage", "ui.dialog", json!({"name": "memory"}), false);
+    });
     group(ui, "Agents", None, app, |ui, app| {
         big(ui, app, "macros", "Commands", "ui.dialog", json!({"name": "commands"}), false);
     });

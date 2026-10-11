@@ -890,3 +890,23 @@
 	The spelling and grammar check of the selection is complete.	選取範圍的拼字與文法檢查已完成。
 	Ignore this word everywhere in this document	在此文件中略過此字的所有出現
 	Accept this word in every document	在所有文件中接受此字
+	Memory Usage	記憶體使用量
+	Memory\nUsage	記憶體\n使用量
+	Release Memory	釋放記憶體
+	Diagnostics	診斷
+	Items	項目數
+	Page images	頁面影像
+	Document pictures	文件中的圖片
+	Undo history	復原歷程記錄
+	Decoded pictures	已解碼的圖片
+	Grammar checker	文法檢查程式
+	WordCraft in total	WordCraft 總計
+	Pages drawn for the screen. Only pages on or near the screen are kept.	為螢幕繪製的頁面。只保留螢幕上或附近的頁面。
+	Pictures in the document, as stored in the file.	文件中的圖片，即檔案中儲存的形式。
+	Steps you can undo or redo. The size is pictures only the history still needs.	可以復原或取消復原的步驟。大小是只有歷程記錄仍需要的圖片。
+	Pictures unpacked for drawing. At most 256 MB; the least recently used go first.	為繪製而解壓縮的圖片。最多 256 MB；最久未使用的最先捨棄。
+	Font files read from disk. Built-in fonts are part of the program.	從磁碟讀取的字型檔案。內建字型是程式的一部分。
+	Rules, dictionary and language models, loaded on the first spelling and grammar check.	規則、字典和語言模型，在第一次拼字及文法檢查時載入。
+	Paragraph layouts kept so edits redraw quickly.	為快速重繪編輯而保留的段落版面配置。
+	Everything WordCraft holds in memory, including the program, the window and the system's buffers.	WordCraft 在記憶體中保留的全部內容，包括程式、視窗和系統緩衝區。
+	Let go of caches that are rebuilt when needed. Your document and undo history are kept.	釋放需要時可重建的快取。文件和復原歷程記錄會保留。

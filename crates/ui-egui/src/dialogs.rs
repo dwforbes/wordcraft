@@ -77,6 +77,10 @@ pub enum Dialog {
     WordCount {
         stats: Value,
     },
+    /// Help › Memory Usage: `tools.memoryUsage` plus the page images the window holds.
+    Memory {
+        report: Value,
+    },
     Zoom {
         percent: f32,
     },
@@ -133,6 +137,7 @@ impl Dialog {
             Dialog::Link { .. } => "link",
             Dialog::Bookmark { .. } => "bookmark",
             Dialog::WordCount { .. } => "wordCount",
+            Dialog::Memory { .. } => "memory",
             Dialog::Zoom { .. } => "zoom",
             Dialog::Watermark { .. } => "watermark",
             Dialog::NewStyle { .. } => "newStyle",
@@ -210,6 +215,7 @@ impl Dialog {
             "link" => Dialog::Link { url: "https://".into(), text: app.session.selected_text() },
             "bookmark" => Dialog::Bookmark { name: String::new() },
             "wordCount" => Dialog::WordCount { stats: app.session.run("review.wordCount", &json!({})).unwrap_or_default() },
+            "memory" => Dialog::Memory { report: app.execute("tools.memoryUsage", json!({})).unwrap_or_default() },
             "zoom" => Dialog::Zoom { percent: (app.session.view.zoom * 100.0).round() },
             "watermark" => Dialog::Watermark { text: "CONFIDENTIAL".into(), diagonal: true },
             "newStyle" => Dialog::NewStyle { name: "Style1".into(), based_on: "Normal".into() },
@@ -300,6 +306,7 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::Link { .. } => "Insert Hyperlink",
         Dialog::Bookmark { .. } => "Bookmark",
         Dialog::WordCount { .. } => "Word Count",
+        Dialog::Memory { .. } => "Memory Usage",
         Dialog::Zoom { .. } => "Zoom",
         Dialog::Watermark { .. } => "Custom Watermark",
         Dialog::NewStyle { .. } => "Create New Style",
@@ -632,6 +639,46 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             let (ok, cancel) = buttons(ui, tl!("Close"));
             ok || cancel
         }
+        Dialog::Memory { report } => {
+            let size = |v: Option<&Value>| match v.and_then(Value::as_u64) {
+                Some(b) => human_bytes(b),
+                None => "—".to_string(),
+            };
+            egui::Grid::new("memory").num_columns(3).spacing(vec2(28.0, 6.0)).striped(true).show(ui, |ui| {
+                ui.label("");
+                ui.label(egui::RichText::new(tl!("Items")).font(semibold(13.0)));
+                ui.label(egui::RichText::new(tl!("Size")).font(semibold(13.0)));
+                ui.end_row();
+                for it in report.get("items").and_then(Value::as_array).into_iter().flatten() {
+                    let name = it.get("name").and_then(Value::as_str).unwrap_or("");
+                    ui.label(tl!(name)).on_hover_text(tl!(memory_hint(name)));
+                    ui.label(it.get("count").and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_default());
+                    ui.label(size(it.get("bytes")));
+                    ui.end_row();
+                }
+                if report.get("resident").is_some_and(|r| !r.is_null()) {
+                    ui.label(egui::RichText::new(tl!("WordCraft in total")).font(semibold(13.0))).on_hover_text(tl!(memory_hint("total")));
+                    ui.label("");
+                    ui.label(egui::RichText::new(size(report.get("resident"))).font(semibold(13.0)));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(tl!("Refresh")).clicked()
+                    && let Ok(v) = app.execute("tools.memoryUsage", json!({}))
+                {
+                    *report = v;
+                }
+                if ui.button(tl!("Release Memory")).on_hover_text(tl!(memory_hint("release"))).clicked()
+                    && let Ok(v) = app.execute("tools.releaseMemory", json!({}))
+                {
+                    *report = v;
+                }
+            });
+            let (ok, cancel) = buttons(ui, tl!("Close"));
+            ok || cancel
+        }
         Dialog::Zoom { percent } => {
             ui.horizontal(|ui| {
                 for p in [200.0, 100.0, 75.0] {
@@ -856,6 +903,36 @@ fn apply_paragraph(
             "keepNext": keep_next, "keepLines": keep_lines, "pageBreakBefore": page_break, "widowControl": widow,
         }}),
     );
+}
+
+/// `1.2 GB`, `48.0 MB`, `512 KB`.
+pub(crate) fn human_bytes(b: u64) -> String {
+    let f = b as f64;
+    if f >= 1e9 {
+        format!("{:.1} GB", f / 1e9)
+    } else if f >= 1e6 {
+        format!("{:.1} MB", f / 1e6)
+    } else if f >= 1e3 {
+        format!("{:.0} KB", f / 1e3)
+    } else {
+        format!("{b} B")
+    }
+}
+
+/// What a row of the memory report covers (hover text).
+fn memory_hint(name: &str) -> &'static str {
+    match name {
+        "Page images" => "Pages drawn for the screen. Only pages on or near the screen are kept.",
+        "Document pictures" => "Pictures in the document, as stored in the file.",
+        "Undo history" => "Steps you can undo or redo. The size is pictures only the history still needs.",
+        "Decoded pictures" => "Pictures unpacked for drawing. At most 256 MB; the least recently used go first.",
+        "Fonts" => "Font files read from disk. Built-in fonts are part of the program.",
+        "Grammar checker" => "Rules, dictionary and language models, loaded on the first spelling and grammar check.",
+        "Layout" => "Paragraph layouts kept so edits redraw quickly.",
+        "total" => "Everything WordCraft holds in memory, including the program, the window and the system's buffers.",
+        "release" => "Let go of caches that are rebuilt when needed. Your document and undo history are kept.",
+        _ => "",
+    }
 }
 
 #[cfg(test)]

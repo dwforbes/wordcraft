@@ -267,6 +267,11 @@ impl WordApp {
     /// Close, Envelopes, Labels and Finish & Merge on a document with unsaved changes first ask
     /// Save / Don't Save / Cancel, and the command runs once that is answered (`ui.saveChanges`).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // From the interface (command search), the report is a dialog.
+        if id == "tools.memoryUsage" {
+            self.dialog = dialogs::Dialog::open("memory", self);
+            return Ok(json!({"dialog": "memory"}));
+        }
         if self.session.dirty && discards_document(id, &params) {
             let name =
                 self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.title_stem());
@@ -525,6 +530,21 @@ impl WordApp {
             "ui.discord" => {
                 self.canvas.open_url = Some("https://discord.gg/artcraft".into());
                 json!({})
+            }
+            // The engine's report, plus the page images only the window knows about.
+            "tools.memoryUsage" | "tools.releaseMemory" => {
+                if id == "tools.releaseMemory" {
+                    self.canvas.release_textures();
+                }
+                let mut r = match self.session.run(id, p) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e.to_string())),
+                };
+                let (n, bytes) = self.canvas.texture_usage();
+                if let Some(items) = r.get_mut("items").and_then(Value::as_array_mut) {
+                    items.insert(0, json!({"name": "Page images", "count": n, "bytes": bytes, "note": "Pages drawn for the screen; only pages on or near the screen are kept"}));
+                }
+                r
             }
             _ => return None,
         }))
@@ -1897,5 +1917,57 @@ mod tests {
         assert!(a.change_picture_target.is_some());
         let _ = a.run("format.bold", json!({}));
         assert!(a.change_picture_target.is_none());
+    }
+
+    /// Only pages on or near the screen keep their rendering: scrolling through a long document
+    /// at 2× held 14 MB per page it had passed, until the window was closed.
+    #[test]
+    fn pages_far_from_the_view_give_back_their_images() {
+        let mut a = app();
+        for k in 0..30 {
+            a.execute("text.insert", json!({"text": format!("Page {k}")})).unwrap();
+            a.execute("insert.pageBreak", json!({})).unwrap();
+        }
+        a.execute("caret.docStart", json!({})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        for _ in 0..12 {
+            h.step();
+        }
+        let (n, bytes) = h.state().canvas.texture_usage();
+        assert!(h.state().canvas.page_texture(0).is_some());
+        assert!((1..=4).contains(&n), "only pages near the top: {n}");
+        assert!(bytes > 0);
+        h.state_mut().execute("caret.docEnd", json!({})).unwrap();
+        h.state_mut().canvas.scroll_to_caret = true;
+        for _ in 0..12 {
+            h.step();
+        }
+        let (n, _) = h.state().canvas.texture_usage();
+        assert!(h.state().canvas.page_texture(0).is_none(), "the first page's image was let go");
+        assert!(h.state().canvas.page_texture(30).is_some(), "the last page is drawn");
+        assert!(n <= 4, "{n}");
+        // The memory report counts them; Release Memory lets them go.
+        let r = h.state_mut().execute("tools.memoryUsage", json!({})).unwrap();
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items[0]["name"], "Page images");
+        assert_eq!(items[0]["count"], n);
+        for name in ["Document pictures", "Undo history", "Decoded pictures", "Fonts", "Grammar checker", "Layout"] {
+            assert!(items.iter().any(|i| i["name"] == name), "{name}");
+        }
+        assert!(r["resident"].as_u64().is_some_and(|b| b > 1 << 20));
+        let r = h.state_mut().execute("tools.releaseMemory", json!({})).unwrap();
+        assert_eq!(r["items"][0]["count"], 0);
+        assert!(h.state().dialog.is_none(), "a script's report is just data");
+        // From the interface, it's a dialog.
+        h.state_mut().run("tools.memoryUsage", json!({})).unwrap();
+        assert_eq!(h.state().dialog.as_ref().map(|d| d.name()), Some("memory"));
+        h.step();
     }
 }

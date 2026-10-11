@@ -102,10 +102,66 @@ fn color(c: Rgb, alpha: f32) -> peniko::Color {
     peniko::Color::from_rgba8(c.0, c.1, c.2, (alpha.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
+/// Decoded pictures kept between renders, least recently used dropped first beyond this.
+const IMAGE_CACHE_BYTES: usize = 256 << 20;
+/// And at most this many.
+const IMAGE_CACHE_ENTRIES: usize = 256;
+
 /// Decoded images by media key (and content pointer), shared across renders.
-fn image_cache() -> &'static Mutex<HashMap<(String, usize), Option<Arc<Pixmap>>>> {
-    static C: std::sync::OnceLock<Mutex<HashMap<(String, usize), Option<Arc<Pixmap>>>>> = std::sync::OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+struct ImageCache {
+    /// (image, bytes, last use).
+    map: HashMap<(String, usize), (Option<Arc<Pixmap>>, usize, u64)>,
+    bytes: usize,
+    tick: u64,
+    budget: usize,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        ImageCache { map: HashMap::new(), bytes: 0, tick: 0, budget: IMAGE_CACHE_BYTES }
+    }
+}
+
+impl ImageCache {
+    fn get(&mut self, k: &(String, usize)) -> Option<Option<Arc<Pixmap>>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(k).map(|e| {
+            e.2 = tick;
+            e.0.clone()
+        })
+    }
+
+    fn insert(&mut self, k: (String, usize), pm: Option<Arc<Pixmap>>) {
+        let size = pm.as_ref().map_or(0, |p| usize::from(p.width()).saturating_mul(usize::from(p.height())).saturating_mul(4));
+        while !self.map.is_empty() && (self.bytes.saturating_add(size) > self.budget || self.map.len() >= IMAGE_CACHE_ENTRIES) {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k.clone()) else { break };
+            if let Some(e) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(e.1);
+            }
+        }
+        self.tick += 1;
+        self.bytes = self.bytes.saturating_add(size);
+        if let Some(old) = self.map.insert(k, (pm, size, self.tick)) {
+            self.bytes = self.bytes.saturating_sub(old.1);
+        }
+    }
+}
+
+fn image_cache() -> &'static Mutex<ImageCache> {
+    static C: std::sync::OnceLock<Mutex<ImageCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(ImageCache::default()))
+}
+
+/// Decoded pictures held for rendering: (count, bytes).
+pub fn image_cache_usage() -> (usize, usize) {
+    let c = image_cache().lock().unwrap_or_else(|e| e.into_inner());
+    (c.map.len(), c.bytes)
+}
+
+/// Forget decoded pictures (they are decoded again when next drawn).
+pub fn clear_image_cache() {
+    *image_cache().lock().unwrap_or_else(|e| e.into_inner()) = ImageCache::default();
 }
 
 /// Decode an encoded image to a premultiplied pixmap.
@@ -138,11 +194,7 @@ fn pixmap_for(doc: &Document, key: &str) -> Option<Arc<Pixmap>> {
         return v.clone();
     }
     let pm = decode_pixmap(bytes).map(Arc::new);
-    let mut c = image_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if c.len() > 256 {
-        c.clear();
-    }
-    c.insert(ck, pm.clone());
+    image_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(ck, pm.clone());
     pm
 }
 
@@ -509,6 +561,28 @@ pub fn render_area(doc: &Document, page: &Page, x: f32, y: f32, w: f32, h: f32, 
 mod tests {
     use super::*;
     use wordcraft_layout::{LayoutCache, LayoutOptions, layout};
+
+    #[test]
+    fn decoded_pictures_stay_within_their_budget_least_recently_used_first() {
+        let pm = |w: u16| Some(Arc::new(Pixmap::new(w, 10)));
+        let key = |n: &str| (n.to_string(), 0usize);
+        // Each 10×10 picture is 400 bytes; the budget holds two.
+        let mut c = ImageCache { budget: 900, ..Default::default() };
+        c.insert(key("a"), pm(10));
+        c.insert(key("b"), pm(10));
+        assert!(c.get(&key("a")).is_some(), "a was used last");
+        c.insert(key("c"), pm(10));
+        assert!(c.get(&key("b")).is_none(), "b, the least recently used, went");
+        assert!(c.get(&key("a")).is_some() && c.get(&key("c")).is_some());
+        assert_eq!((c.map.len(), c.bytes), (2, 800));
+        // One picture larger than the budget is still kept (alone), so it draws.
+        c.insert(key("huge"), pm(100));
+        assert_eq!((c.map.len(), c.bytes), (1, 4000));
+        // Replacing an entry doesn't count it twice; failed decodes cost nothing.
+        c.insert(key("huge"), pm(10));
+        c.insert(key("bad"), None);
+        assert_eq!(c.bytes, 400);
+    }
 
     #[test]
     fn renders_text_dark_pixels() {
