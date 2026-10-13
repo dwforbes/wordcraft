@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use wordcraft_doc::numbering::{AbstractNum, Level, ListKind, Num, levels_for};
-use wordcraft_doc::para::{InlineObject, NoteKind, OBJ, PAGE_BREAK};
+use wordcraft_doc::para::{InlineObject, NoteKind, OBJ, PAGE_BREAK, Run};
 use wordcraft_doc::props::{
     Border, BorderStyle, Borders, CellProps, CharProps, NumRef, ParaProps, RowProps, TextColor, Underline, VMerge, VertAlign,
 };
@@ -65,6 +65,9 @@ pub enum Inline {
     Image(Img),
     /// A bookmark (link target).
     Anchor(String),
+    /// A chart or diagram known here only by its alt text: written where alt text has a place
+    /// (an HTML or Markdown image), left out of editable formats so it never turns into body text.
+    Figure(String),
     /// An equation in the linear format WordCraft keeps them in (`x=(-b±√(b^2-4ac))/2a`). Formats
     /// without equations write `linear` as text.
     Equation {
@@ -154,6 +157,19 @@ pub struct ListInfo {
     pub level: u8,
 }
 
+/// Paragraph spacing and indents (points) that a source states on the paragraph itself (RTF);
+/// left out, they come from the style.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Spacing {
+    pub before: Option<f32>,
+    pub after: Option<f32>,
+    pub line: Option<wordcraft_doc::props::LineSpacing>,
+    pub left: Option<f32>,
+    pub right: Option<f32>,
+    /// First-line indent; negative = hanging.
+    pub first: Option<f32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Para {
     pub kind: Kind,
@@ -161,6 +177,9 @@ pub struct Para {
     pub align: Option<Align>,
     pub page_break: bool,
     pub inlines: Vec<Inline>,
+    pub spacing: Spacing,
+    /// Borders the source puts on the paragraph itself (RTF `\brdrb`…).
+    pub borders: Option<wordcraft_doc::props::Borders>,
 }
 
 impl Para {
@@ -186,7 +205,23 @@ impl Para {
         for i in &self.inlines {
             match i {
                 Inline::Text(t, _) | Inline::Equation { linear: t, .. } => s.push_str(t),
-                Inline::Image(_) | Inline::Anchor(_) | Inline::Note(_) => {}
+                Inline::Image(_) | Inline::Anchor(_) | Inline::Figure(_) | Inline::Note(_) => {}
+            }
+        }
+        s
+    }
+    /// [`Self::text`] as it reads on screen: text set in a symbol font (Symbol, Wingdings…) as
+    /// its Unicode equivalents ([`wordcraft_doc::symbol_fonts`]), for plain-text export.
+    pub fn shown_text(&self) -> String {
+        let mut s = String::new();
+        for i in &self.inlines {
+            match i {
+                Inline::Text(t, f) => match f.font.as_deref() {
+                    Some(font) if wordcraft_doc::symbol_fonts::is_symbol_font(font) => s.push_str(&wordcraft_doc::symbol_fonts::map_text(font, t)),
+                    _ => s.push_str(t),
+                },
+                Inline::Equation { linear: t, .. } => s.push_str(t),
+                Inline::Image(_) | Inline::Anchor(_) | Inline::Figure(_) | Inline::Note(_) => {}
             }
         }
         s
@@ -197,8 +232,15 @@ impl Para {
 
     /// Remove whitespace at the very start and end of the paragraph's text.
     pub fn trim(&mut self) {
+        const WS: &[char] = &[' ', '\t', '\r', '\n'];
+        self.trim_with(WS, WS);
+    }
+
+    /// Remove the characters in `start` from the start of the paragraph's text and those in
+    /// `end` from its end.
+    pub fn trim_with(&mut self, start: &[char], end: &[char]) {
         while let Some(Inline::Text(t, _)) = self.inlines.first_mut() {
-            let n = t.trim_start_matches([' ', '\t', '\r', '\n']).len();
+            let n = t.trim_start_matches(start).len();
             let cut = t.len() - n;
             t.replace_range(..cut, "");
             if t.is_empty() {
@@ -208,7 +250,7 @@ impl Para {
             }
         }
         while let Some(Inline::Text(t, _)) = self.inlines.last_mut() {
-            let n = t.trim_end_matches([' ', '\t', '\r', '\n']).len();
+            let n = t.trim_end_matches(end).len();
             t.truncate(n);
             if t.is_empty() {
                 self.inlines.pop();
@@ -229,11 +271,13 @@ pub struct Cell {
     pub covered: bool,
     pub header: bool,
     pub shading: Option<Rgb>,
+    /// The cell's own borders (RTF `\clbrdr…`), drawn whatever the table's style.
+    pub borders: Option<wordcraft_doc::props::Borders>,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { blocks: Vec::new(), colspan: 1, rowspan: 1, covered: false, header: false, shading: None }
+        Cell { blocks: Vec::new(), colspan: 1, rowspan: 1, covered: false, header: false, shading: None, borders: None }
     }
 }
 
@@ -410,6 +454,26 @@ fn rule_borders() -> Borders {
     Borders { bottom: Some(Border { style: BorderStyle::Single, width: 0.75, color: Some(Rgb(0xA0, 0xA0, 0xA0)), space: 1.0 }), ..Default::default() }
 }
 
+/// Append text (without object characters) or one inline object to the end of `p`.
+fn append(p: &mut Paragraph, text: &str, props: &CharProps, obj: Option<InlineObject>) {
+    let text: std::borrow::Cow<str> = if text.contains(OBJ) { text.chars().filter(|c| *c != OBJ).collect::<String>().into() } else { text.into() };
+    let piece = match obj {
+        Some(o) => {
+            p.objects.push(o);
+            OBJ.to_string()
+        }
+        None => text.into_owned(),
+    };
+    if piece.is_empty() {
+        return;
+    }
+    p.text.push_str(&piece);
+    match p.runs.last_mut() {
+        Some(last) if last.props == *props => last.len += piece.len(),
+        _ => p.runs.push(Run { len: piece.len(), props: props.clone() }),
+    }
+}
+
 struct Builder<'a> {
     doc: &'a mut Document,
     /// Building a note's content (notes don't nest).
@@ -432,6 +496,8 @@ impl Builder<'_> {
         out.props.style = style;
         if p.kind == Kind::Rule {
             out.props.borders = Some(rule_borders());
+        } else if p.borders.is_some() {
+            out.props.borders = p.borders;
         }
         if let (Some(li), Some(num)) = (p.list, list_num) {
             if out.props.style.is_none() {
@@ -440,11 +506,19 @@ impl Builder<'_> {
             out.props.numbering = Some(NumRef { num, level: li.level.min(8) });
         }
         out.props.align = p.align;
+        let sp = p.spacing;
+        out.props.space_before = sp.before.or(out.props.space_before);
+        out.props.space_after = sp.after.or(out.props.space_after);
+        out.props.line_spacing = sp.line.or(out.props.line_spacing);
+        out.props.indent_left = sp.left.or(out.props.indent_left);
+        out.props.indent_right = sp.right.or(out.props.indent_right);
+        out.props.indent_first = sp.first.or(out.props.indent_first);
         if p.page_break {
             out.props.page_break_before = Some(true);
         }
+        // Inlines are appended in order, so build the runs directly: inserting each one through
+        // `Paragraph::insert_text` rescans every earlier run and is quadratic in their number.
         for i in &p.inlines {
-            let end = out.len();
             match i {
                 Inline::Text(t, f) => {
                     let t = clean_text(t);
@@ -452,36 +526,35 @@ impl Builder<'_> {
                     if matches!(p.kind, Kind::Code | Kind::Raw) && cp.font.as_deref() == Some(MONO_FONT) {
                         cp.font = None;
                     }
-                    let _ = out.insert_text(end, &t, &cp);
+                    append(&mut out, &t, &cp, None);
                 }
                 Inline::Image(img) => {
                     let key = self.doc.add_media(img.data.to_vec(), &img.ext);
                     let (w, h) = (finite_or(img.w, 72.0).clamp(1.0, 1584.0), finite_or(img.h, 72.0).clamp(1.0, 1584.0));
-                    let obj = InlineObject::Image { media: key, w, h, alt: img.alt.clone(), float: Default::default(), crop: [0.0; 4] };
-                    let _ = out.insert_object(end, obj, &CharProps::default());
+                    let obj = InlineObject::Image { media: key, w, h, alt: img.alt.clone(), float: Default::default(), crop: [0.0; 4], ole: None };
+                    append(&mut out, "", &CharProps::default(), Some(obj));
                 }
                 Inline::Anchor(name) => {
-                    let _ = out.insert_object(end, InlineObject::BookmarkStart { name: name.clone() }, &CharProps::default());
-                    let e2 = out.len();
-                    let _ = out.insert_object(e2, InlineObject::BookmarkEnd { name: name.clone() }, &CharProps::default());
+                    append(&mut out, "", &CharProps::default(), Some(InlineObject::BookmarkStart { name: name.clone() }));
+                    append(&mut out, "", &CharProps::default(), Some(InlineObject::BookmarkEnd { name: name.clone() }));
                 }
+                Inline::Figure(_) => {}
                 Inline::Equation { linear, display } => {
                     let linear = clean_text(linear);
                     if !linear.is_empty() {
-                        let _ = out.insert_object(
-                            end,
-                            InlineObject::Equation { linear, display: *display, math: Default::default() },
-                            &CharProps::default(),
-                        );
+                        let obj = InlineObject::Equation { linear, display: *display, math: Default::default() };
+                        append(&mut out, "", &CharProps::default(), Some(obj));
                     }
                 }
                 Inline::Note(n) if !self.in_note => {
                     let id = self.note(n);
-                    let _ = out.insert_object(end, InlineObject::NoteRef { kind: NoteKind::Footnote, id, custom: String::new() }, &note_ref_props());
+                    append(&mut out, "", &note_ref_props(), Some(InlineObject::NoteRef { kind: NoteKind::Footnote, id, custom: String::new() }));
                 }
                 Inline::Note(_) => {}
             }
         }
+        out.normalize();
+        out.touch();
         out
     }
 
@@ -624,7 +697,7 @@ impl Builder<'_> {
         }
         tb.rows.clear();
         for r in rows {
-            let mut row = wordcraft_doc::Row { props: RowProps::default(), cells: Vec::new() };
+            let mut row = wordcraft_doc::Row { props: RowProps::default(), cells: Vec::new(), controls: Default::default() };
             row.props.header = !r.is_empty() && r.iter().all(|c| c.header);
             let mut g = 0usize;
             for c in r.iter().take(wordcraft_doc::table::MAX_COLS) {
@@ -643,8 +716,9 @@ impl Builder<'_> {
                     VMerge::None
                 };
                 row.cells.push(wordcraft_doc::Cell {
-                    props: CellProps { width: Some(w), span: span as u32, vmerge, shading: c.shading, ..Default::default() },
+                    props: CellProps { width: Some(w), span: span as u32, vmerge, shading: c.shading, borders: c.borders, ..Default::default() },
                     blocks,
+                    controls: Default::default(),
                 });
             }
             if row.cells.is_empty() {
@@ -666,7 +740,13 @@ fn finite_or(v: f32, d: f32) -> f32 {
 
 /// Build a document from a flow.
 pub fn to_doc(flow: &Flow) -> Document {
+    to_doc_in(flow, wordcraft_doc::SectionProps::default())
+}
+
+/// [`to_doc`] on a page of the source's own size and margins (`section`), which tables size to.
+pub fn to_doc_in(flow: &Flow, section: wordcraft_doc::SectionProps) -> Document {
     let mut doc = Document::new();
+    doc.last_section = section;
     doc.numbering = Default::default();
     let uses_code = uses_kind(&flow.blocks, Kind::Code, 0);
     if uses_code {
@@ -703,6 +783,16 @@ fn uses_raw_text(blocks: &[FBlock], depth: usize) -> bool {
             }),
             FBlock::Table(t) => t.rows.iter().flatten().any(|c| uses_raw_text(&c.blocks, depth + 1)),
         })
+}
+
+/// `blocks` as document blocks of `doc` (their pictures go into its media), for a header,
+/// footer or other part an importer adds itself.
+pub fn part_blocks(doc: &mut Document, blocks: &[FBlock]) -> Blocks {
+    let mut out = Builder { doc, in_note: false, labels: Default::default() }.blocks(blocks, 0);
+    if out.is_empty() {
+        out.push(para_block(Paragraph::new()));
+    }
+    out
 }
 
 fn uses_kind(blocks: &[FBlock], k: Kind, depth: usize) -> bool {
@@ -821,7 +911,15 @@ pub fn flow_paras(doc: &Document, p: &Paragraph) -> Vec<Para> {
 fn flow_paras_in(doc: &Document, p: &Paragraph, in_note: bool) -> Vec<Para> {
     let (kind, list) = para_kind(doc, p);
     let mut done: Vec<Para> = Vec::new();
-    let mut out = Para { kind, list, align: p.props.align, page_break: p.props.page_break_before.unwrap_or(false), inlines: Vec::new() };
+    let mut out = Para {
+        kind,
+        list,
+        align: p.props.align,
+        page_break: p.props.page_break_before.unwrap_or(false),
+        inlines: Vec::new(),
+        spacing: Spacing::default(),
+        borders: None,
+    };
     let in_code = kind == Kind::Code;
     let mut k = 0usize;
     for (range, props) in p.run_ranges() {
@@ -833,7 +931,15 @@ fn flow_paras_in(doc: &Document, p: &Paragraph, in_note: bool) -> Vec<Para> {
             if c == PAGE_BREAK {
                 if !hidden {
                     out.push_text(&std::mem::take(&mut buf), &f);
-                    let next = Para { kind, list: None, align: p.props.align, page_break: true, inlines: Vec::new() };
+                    let next = Para {
+                        kind,
+                        list: None,
+                        align: p.props.align,
+                        page_break: true,
+                        inlines: Vec::new(),
+                        spacing: Spacing::default(),
+                        borders: None,
+                    };
                     let prev = std::mem::replace(&mut out, next);
                     if prev.inlines.is_empty() {
                         out.page_break |= prev.page_break;
@@ -864,6 +970,14 @@ fn flow_paras_in(doc: &Document, p: &Paragraph, in_note: bool) -> Vec<Para> {
                         }
                         None if !alt.is_empty() => buf.push_str(alt),
                         None => {}
+                    }
+                }
+                Some(InlineObject::Graphic { alt, .. }) => {
+                    if !buf.is_empty() {
+                        out.push_text(&std::mem::take(&mut buf), &f);
+                    }
+                    if !alt.trim().is_empty() {
+                        out.inlines.push(Inline::Figure(alt.clone()));
                     }
                 }
                 Some(InlineObject::Equation { linear, display, math }) => {
@@ -967,11 +1081,16 @@ fn flow_table(doc: &Document, t: &Table, depth: usize, in_note: bool) -> FTable 
                 covered: c.props.vmerge == VMerge::Continue,
                 header,
                 shading: c.props.shading,
+                borders: c.props.borders,
             });
         }
         rows.push(cells);
     }
-    FTable { rows, widths: t.grid.clone(), borderless: false }
+    // Without a table style and without visible table or cell borders the table shows no grid.
+    let visible = |b: &Option<wordcraft_doc::props::Borders>| b.as_ref().is_some_and(|b| b.any_visible());
+    let borderless =
+        t.props.style.is_none() && !visible(&t.props.borders) && t.rows.iter().flat_map(|r| &r.cells).all(|c| !visible(&c.props.borders));
+    FTable { rows, widths: t.grid.clone(), borderless }
 }
 
 /// The document body as a flow.

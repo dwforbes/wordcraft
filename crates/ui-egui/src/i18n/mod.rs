@@ -14,12 +14,14 @@
 //! # Adding a language
 //! 1. Add `xx.tsv` next to `zh-hans.tsv` (copy its header; translate from the *meaning* of the
 //!    English text, clean-room: never from Microsoft Word's or another product's localisation).
-//! 2. Add one row to [`LANGUAGES`].
+//! 2. Add one row to [`LANGUAGES`]. Set its `editing_lang` only when `wordcraft-proof` can proof
+//!    the language (Polish: `pl-PL`): new documents are then written in it.
 //!
 //! The Options dropdown, the system-language match and the catalog tests pick it up from there.
 //!
 //! # Looking strings up
 //! - [`tl!`](crate::tl) / [`t`]: a string in the current language. [`tr`]: in a given one.
+//! - [`tc`] / [`trc`]: worded for a context (`preview`), for text that must fit a tight spot.
 //! - [`location`]: a ribbon location such as `Home › Font`, segment by segment.
 //! - [`fmt`]: fill `{name}` placeholders after a lookup; translators may reorder them.
 
@@ -43,23 +45,90 @@ pub struct LangInfo {
     pub source: &'static str,
     /// Which CJK interface face comes first (Chinese text wants the Chinese face).
     pub prefer_hans: bool,
+    /// The language (BCP 47) new blank documents are written in with this interface, for
+    /// languages WordCraft can proof; `None` keeps WordCraft's default, US English.
+    pub editing_lang: Option<&'static str>,
     catalog: OnceLock<Catalog>,
 }
 
 /// The registry. English first: it is the fallback and the source language.
-pub static LANGUAGES: [LangInfo; 7] = [
-    LangInfo { code: "en", name: "English", source: "", prefer_hans: false, catalog: OnceLock::new() },
+pub static LANGUAGES: [LangInfo; 19] = [
+    LangInfo { code: "en", name: "English", source: "", prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // Simplified Chinese; `zh`, `zh-CN`, `zh-SG` and `zh-Hans-*` resolve here (see `candidates`).
-    LangInfo { code: "zh-hans", name: "简体中文", source: include_str!("zh-hans.tsv"), prefer_hans: true, catalog: OnceLock::new() },
+    LangInfo {
+        code: "zh-hans",
+        name: "简体中文",
+        source: include_str!("zh-hans.tsv"),
+        prefer_hans: true,
+        editing_lang: None,
+        catalog: OnceLock::new(),
+    },
     // Traditional Chinese (Taiwan vocabulary); `zh-TW`, `zh-HK`, `zh-MO` and `zh-Hant-*` resolve here.
-    LangInfo { code: "zh-hant", name: "繁體中文", source: include_str!("zh-hant.tsv"), prefer_hans: true, catalog: OnceLock::new() },
-    LangInfo { code: "ja", name: "日本語", source: include_str!("ja.tsv"), prefer_hans: false, catalog: OnceLock::new() },
-    LangInfo { code: "uk", name: "Українська", source: include_str!("uk.tsv"), prefer_hans: false, catalog: OnceLock::new() },
+    LangInfo {
+        code: "zh-hant",
+        name: "繁體中文",
+        source: include_str!("zh-hant.tsv"),
+        prefer_hans: true,
+        editing_lang: None,
+        catalog: OnceLock::new(),
+    },
+    LangInfo { code: "ja", name: "日本語", source: include_str!("ja.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    LangInfo {
+        code: "uk", name: "Українська", source: include_str!("uk.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new()
+    },
     // Spanish, neutral across Spain and Latin America; `es-ES`, `es-MX`, `es-419` … resolve here.
-    LangInfo { code: "es", name: "Español", source: include_str!("es.tsv"), prefer_hans: false, catalog: OnceLock::new() },
+    LangInfo { code: "es", name: "Español", source: include_str!("es.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
     // Brazilian Portuguese; `pt-BR` and `pt-BR-*` resolve here. Plain `pt` and `pt-PT` have no
     // catalog yet (the European vocabulary differs), so they stay in English.
-    LangInfo { code: "pt-br", name: "Português (Brasil)", source: include_str!("pt-br.tsv"), prefer_hans: false, catalog: OnceLock::new() },
+    LangInfo {
+        code: "pt-br",
+        name: "Português (Brasil)",
+        source: include_str!("pt-br.tsv"),
+        prefer_hans: false,
+        editing_lang: Some("pt-BR"),
+        catalog: OnceLock::new(),
+    },
+    // Serbian, Cyrillic script (the default per BCP 47 when no script is given); `sr`, `sr-RS`,
+    // `sr-Cyrl-*` resolve here.
+    LangInfo { code: "sr", name: "Српски", source: include_str!("sr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Serbian, Latin script; `sr-Latn-*` resolves here (see `candidates`'s generic prefix
+    // matching — no special-casing needed, unlike Chinese's script-by-region fallback).
+    LangInfo {
+        code: "sr-latn",
+        name: "Srpski (latinica)",
+        source: include_str!("sr-latn.tsv"),
+        prefer_hans: false,
+        editing_lang: None,
+        catalog: OnceLock::new(),
+    },
+    // Polish; `pl`, `pl-PL` and `pl_PL.UTF-8` resolve here. WordCraft proofs Polish (spelling,
+    // grammar, hyphenation), so new documents are written in Polish with this interface.
+    LangInfo {
+        code: "pl",
+        name: "Polski",
+        source: include_str!("pl.tsv"),
+        prefer_hans: false,
+        editing_lang: Some("pl-PL"),
+        catalog: OnceLock::new(),
+    },
+    LangInfo { code: "cs", name: "Čeština", source: include_str!("cs.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    LangInfo { code: "et", name: "Eesti", source: include_str!("et.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // German, neutral across Germany, Austria and Switzerland; `de`, `de-DE`, `de-AT`, `de-CH` …
+    // resolve here.
+    LangInfo { code: "de", name: "Deutsch", source: include_str!("de.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Russian; `ru`, `ru-RU`, `ru_RU.UTF-8` and other regions resolve here.
+    LangInfo { code: "ru", name: "Русский", source: include_str!("ru.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    LangInfo { code: "tr", name: "Türkçe", source: include_str!("tr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Italian; `it-IT`, `it-CH` and `it-*` resolve here.
+    LangInfo { code: "it", name: "Italiano", source: include_str!("it.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Hungarian; `hu`, `hu-HU` and `hu_HU.UTF-8` resolve here.
+    LangInfo { code: "hu", name: "Magyar", source: include_str!("hu.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // French; `fr`, `fr-FR`, `fr_CA` and other regions resolve here.
+    LangInfo { code: "fr", name: "Français", source: include_str!("fr.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new() },
+    // Bulgarian; `bg`, `bg-BG` and `bg_BG.UTF-8` resolve here.
+    LangInfo {
+        code: "bg", name: "Български", source: include_str!("bg.tsv"), prefer_hans: false, editing_lang: None, catalog: OnceLock::new()
+    },
 ];
 
 impl LangInfo {
@@ -105,6 +174,24 @@ impl Lang {
 
     pub fn prefers_hans(self) -> bool {
         self.0.prefer_hans
+    }
+
+    /// The language new blank documents are written in with this interface ([`LangInfo::editing_lang`]).
+    pub fn editing_lang(self) -> Option<&'static str> {
+        self.0.editing_lang
+    }
+
+    /// Is the interface written in CJK script (its own name is), so it needs a CJK face?
+    pub fn uses_cjk(self) -> bool {
+        self.0.name.chars().any(|c| ('\u{2E80}'..='\u{9FFF}').contains(&c) || ('\u{AC00}'..='\u{D7AF}').contains(&c))
+    }
+
+    /// The CJK interface text the fonts must cover with the Chinese (`hans`) or other CJK fallback
+    /// order: the catalogs of the CJK languages using that order, and every language's own name (the
+    /// Options list). The interface fonts check the embedded faces against it (#486).
+    pub fn cjk_font_text(hans: bool) -> (Vec<&'static str>, String) {
+        let catalogs = Lang::all().filter(|l| l.uses_cjk() && l.prefers_hans() == hans).map(|l| l.0.source).collect();
+        (catalogs, Lang::all().map(Lang::name).collect::<Vec<_>>().join(" "))
     }
 
     /// A language by its exact code (any case).
@@ -190,6 +277,32 @@ fn detect_system_lang() -> Lang {
     first_supported(tags.iter().map(String::as_str)).unwrap_or(Lang::EN)
 }
 
+/// The system region (#838): it picks the paper File › New starts on, the default measurement
+/// unit and the decimal separator, independently of the interface language (an English
+/// interface in Germany still gets A4 and centimetres). `en-US` in tests.
+pub fn system_region() -> wordcraft_engine::Region {
+    if cfg!(test) {
+        return wordcraft_engine::Region::default();
+    }
+    let var = |name: &str| std::env::var(name).ok().filter(|v| usable_locale(v));
+    // One tag for everything: an explicit override, or `LC_ALL`.
+    if let Some(tag) = var("WORDCRAFT_REGION").or_else(|| var("LC_ALL")) {
+        return wordcraft_engine::Region::from_tag(&tag);
+    }
+    // Unix sets each convention on its own: numbers (`LC_NUMERIC`, else `LANG`), paper
+    // (`LC_PAPER`) and measurement (`LC_MEASUREMENT`). Elsewhere, and when none is set, the
+    // platform's first preferred locale (on macOS it carries the region, as in `en-PL`; on the web
+    // it is the browser's language).
+    let base = var("LC_NUMERIC").or_else(|| var("LANG")).unwrap_or_else(|| sys_locale::get_locale().unwrap_or_default());
+    wordcraft_engine::Region::from_tag(&base).with_paper_and_measurement(var("LC_PAPER").as_deref(), var("LC_MEASUREMENT").as_deref())
+}
+
+/// A locale variable that names a locale (not empty, `C` or `POSIX`).
+fn usable_locale(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && !v.eq_ignore_ascii_case("c") && !v.eq_ignore_ascii_case("posix") && !v.starts_with("C.")
+}
+
 thread_local! {
     // Per thread: parallel test harnesses must not change each other's language.
     static CURRENT: Cell<Lang> = const { Cell::new(Lang::EN) };
@@ -215,9 +328,72 @@ pub fn t(s: &str) -> &str {
     tr(current(), s)
 }
 
+/// `s` in the current language as worded for `context` (one of `catalog::CONTEXTS`), falling
+/// back to the plain translation and then to English.
+pub fn tc<'a>(context: &str, s: &'a str) -> &'a str {
+    trc(current(), context, s)
+}
+
+/// [`tc`] in a given language.
+pub fn trc<'a>(lang: Lang, context: &str, s: &'a str) -> &'a str {
+    #[cfg(test)]
+    if pseudo::on() {
+        return pseudo::mark(s);
+    }
+    lang.catalog().in_context(context, s).unwrap_or(s)
+}
+
+/// Lowercase translated interface labels and UI search queries in the current language.
+/// Turkish has two distinct I pairs: `İ`/`i` and `I`/`ı`. Unicode's default casing turns `İ`
+/// into `i` plus a combining dot, which would prevent `italik` from finding `İtalik`.
+/// Command IDs and document text keep their own existing casing semantics.
+pub fn lowercase(s: &str) -> String {
+    if current().code() != "tr" {
+        return s.to_lowercase();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'İ' => out.push('i'),
+            'I' => out.push('ı'),
+            _ => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
 /// `s` in `lang`; strings without a translation come back unchanged.
 pub fn tr(lang: Lang, s: &str) -> &str {
+    #[cfg(test)]
+    if pseudo::on() {
+        return pseudo::mark(s);
+    }
     lang.catalog().plain(s).unwrap_or(s)
+}
+
+/// A style's name as the interface shows it: built-in styles (`Normal`, `Heading 2`, `TOC 3`) in
+/// the current language, styles the author made exactly as named. Display only: the document,
+/// commands and saved files keep the English name.
+pub fn style_name(style: &wordcraft_doc::Style) -> String {
+    if style.builtin { builtin_style_name(&style.name) } else { style.name.clone() }
+}
+
+/// A built-in style's English name in the current language; numbered families go through one
+/// template each (`Heading {n}`), and names without a translation stay English.
+pub fn builtin_style_name(name: &str) -> String {
+    let direct = t(name);
+    if direct != name {
+        return direct.to_string();
+    }
+    for (prefix, template) in [("Heading ", "Heading {n}"), ("TOC ", "TOC {n}"), ("Index ", "Index {n}")] {
+        if let Some(n) = name.strip_prefix(prefix)
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+        {
+            return fmt(t(template), &[("n", n)]);
+        }
+    }
+    name.to_string()
 }
 
 /// A ribbon location (`Home › Font`) in the current language, segment by segment.
@@ -260,5 +436,9 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
     out
 }
 
+#[cfg(test)]
+mod audit;
+#[cfg(test)]
+pub(crate) mod pseudo;
 #[cfg(test)]
 mod tests;

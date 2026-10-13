@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod region;
+pub use region::Region;
+
 /// Points per inch.
 pub const PT_PER_IN: f32 = 72.0;
 /// Twips (1/20 pt) per point.
@@ -80,18 +83,27 @@ impl Unit {
     }
     /// Format `pt` in this unit the way Word's fields show it (`1"`, `2.54 cm`, `12 pt`).
     pub fn format(self, pt: f32) -> String {
+        self.format_with(pt, '.')
+    }
+    /// [`Unit::format`] with the region's decimal separator (`2,54 cm` with `,`).
+    pub fn format_with(self, pt: f32, decimal: char) -> String {
+        format!("{}{}", self.number(pt, decimal), self.suffix())
+    }
+    /// `pt` as a number in this unit, at most two decimals, without the unit (`2,54` with `,`).
+    pub fn number(self, pt: f32, decimal: char) -> String {
         let v = finite(pt) / self.pt_per_unit();
         let s = format!("{v:.2}");
-        let s = s.trim_end_matches('0').trim_end_matches('.');
+        let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { &s };
         let s = if s == "-0" { "0" } else { s };
-        format!("{s}{}", self.suffix())
+        s.replace('.', &decimal.to_string())
     }
 }
 
 /// Parse a measurement typed by a user: `1"`, `1 in`, `2.5cm`, `12pt`, `3 pi`, `10 mm`, `1.5 li`
-/// (lines are 12 pt). A bare number is in `default`. Returns points.
+/// (lines are 12 pt). A bare number is in `default`. Returns points. Either decimal separator
+/// works (`2,5 cm` and `2.5 cm`), whatever the region.
 pub fn parse_measure(s: &str, default: Unit) -> Option<f32> {
-    let t = s.trim().to_ascii_lowercase();
+    let t = s.trim().to_ascii_lowercase().replace('\u{2212}', "-");
     if t.is_empty() {
         return None;
     }
@@ -167,6 +179,93 @@ impl Rect {
     }
 }
 
+/// An angle in degrees brought into `0..360` (NaN and infinities become 0).
+pub fn normalize_degrees(deg: f32) -> f32 {
+    if !deg.is_finite() {
+        return 0.0;
+    }
+    let d = deg.rem_euclid(360.0);
+    // `rem_euclid` can round up to exactly 360 for tiny negative angles.
+    if (0.0..360.0).contains(&d) { d } else { 0.0 }
+}
+
+/// How a drawing is turned about its centre: mirrored first (`flip_h` left to right, `flip_v` top
+/// to bottom), then rotated `deg` degrees clockwise (page space, y down), as DrawingML's `a:xfrm`
+/// `flipH`, `flipV` and `rot` say (ECMA-376 §20.1.7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Spin {
+    pub deg: f32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+impl Spin {
+    /// A spin with its angle normalised to `0..360`.
+    pub fn new(deg: f32, flip_h: bool, flip_v: bool) -> Spin {
+        Spin { deg: normalize_degrees(deg), flip_h, flip_v }
+    }
+
+    /// No rotation and no mirroring.
+    pub fn is_identity(&self) -> bool {
+        normalize_degrees(self.deg) == 0.0 && !self.flip_h && !self.flip_v
+    }
+
+    /// The linear part (a, b, c, d: x' = a·x + c·y, y' = b·x + d·y).
+    fn linear(&self) -> [f32; 4] {
+        let r = normalize_degrees(self.deg).to_radians();
+        let (s, c) = r.sin_cos();
+        let fx = if self.flip_h { -1.0 } else { 1.0 };
+        let fy = if self.flip_v { -1.0 } else { 1.0 };
+        [c * fx, s * fx, -s * fy, c * fy]
+    }
+
+    /// The affine map (a, b, c, d, e, f: x' = a·x + c·y + e, y' = b·x + d·y + f) turning the page
+    /// about point (`cx`, `cy`).
+    pub fn matrix(&self, cx: f32, cy: f32) -> [f32; 6] {
+        let [a, b, c, d] = self.linear();
+        let (cx, cy) = (finite(cx), finite(cy));
+        [a, b, c, d, cx - (a * cx + c * cy), cy - (b * cx + d * cy)]
+    }
+
+    /// Where point (`x`, `y`) goes when turned about (`cx`, `cy`).
+    pub fn apply(&self, cx: f32, cy: f32, x: f32, y: f32) -> (f32, f32) {
+        let [a, b, c, d] = self.linear();
+        let (u, v) = (x - cx, y - cy);
+        (cx + a * u + c * v, cy + b * u + d * v)
+    }
+
+    /// The point that [`Spin::apply`] takes to (`x`, `y`).
+    pub fn unapply(&self, cx: f32, cy: f32, x: f32, y: f32) -> (f32, f32) {
+        // The linear part is orthogonal: its inverse is its transpose.
+        let [a, b, c, d] = self.linear();
+        let (u, v) = (x - cx, y - cy);
+        (cx + a * u + b * v, cy + c * u + d * v)
+    }
+
+    /// The axis-aligned box `r` covers once turned about its centre.
+    pub fn bounds(&self, r: Rect) -> Rect {
+        let (bw, bh) = self.extent(r.w, r.h);
+        Rect::new(r.x + (r.w - bw) / 2.0, r.y + (r.h - bh) / 2.0, bw, bh)
+    }
+
+    /// The width and height of the box a `w` × `h` rectangle covers once turned.
+    pub fn extent(&self, w: f32, h: f32) -> (f32, f32) {
+        let (w, h) = (finite(w).abs(), finite(h).abs());
+        let r = normalize_degrees(self.deg).to_radians();
+        let (s, c) = (r.sin().abs(), r.cos().abs());
+        (w * c + h * s, w * s + h * c)
+    }
+
+    /// This spin applied inside `outer` (a group member's own spin within its group's): the one
+    /// spin doing both.
+    pub fn within(self, outer: Spin) -> Spin {
+        // outer = R(θo)·Fo, self = R(θs)·Fs; Fo·R(θ) = R(±θ)·Fo (one mirror reverses the turn).
+        let one_mirror = outer.flip_h != outer.flip_v;
+        let inner = if one_mirror { -self.deg } else { self.deg };
+        Spin::new(outer.deg + inner, outer.flip_h != self.flip_h, outer.flip_v != self.flip_v)
+    }
+}
+
 /// Standard paper sizes (Word's Layout › Size gallery), in points (portrait).
 pub const PAPER_SIZES: &[(&str, f32, f32)] = &[
     ("Letter", 612.0, 792.0),
@@ -218,6 +317,13 @@ mod tests {
         assert_eq!(parse_measure("abc", Unit::Inches), None);
         assert_eq!(parse_measure("", Unit::Inches), None);
         assert_eq!(parse_measure("1 furlong", Unit::Inches), None);
+        // Both decimal separators, whatever the region (#838).
+        let comma = parse_measure("2,54 cm", Unit::Inches).unwrap();
+        assert!((comma - 72.0).abs() < 0.01);
+        assert_eq!(parse_measure("1,5", Unit::Inches), Some(108.0));
+        assert_eq!(parse_measure("1.5\"", Unit::Centimeters), Some(108.0));
+        assert_eq!(parse_measure("\u{2212}1 in", Unit::Points), Some(-72.0));
+        assert_eq!(parse_measure("1,2,3", Unit::Inches), None);
     }
 
     #[test]
@@ -226,6 +332,10 @@ mod tests {
         assert_eq!(Unit::Inches.format(90.0), "1.25\"");
         assert_eq!(Unit::Points.format(12.0), "12 pt");
         assert_eq!(Unit::Centimeters.format(72.0), "2.54 cm");
+        assert_eq!(Unit::Centimeters.format_with(72.0, ','), "2,54 cm");
+        assert_eq!(Unit::Inches.format_with(108.0, ','), "1,5\"");
+        assert_eq!(Unit::Points.format_with(720.0, ','), "720 pt");
+        assert_eq!(Unit::Inches.format_with(f32::NAN, ','), "0\"");
     }
 
     #[test]

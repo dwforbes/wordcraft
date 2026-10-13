@@ -51,7 +51,15 @@ fn sample() -> Document {
     let n = ip.len();
     ip.insert_object(
         n,
-        InlineObject::Image { media: key, w: 80.0, h: 40.0, alt: "gradient".into(), float: Default::default(), crop: [0.1, 0.0, 0.0, 0.0] },
+        InlineObject::Image {
+            media: key,
+            w: 80.0,
+            h: 40.0,
+            alt: "gradient".into(),
+            float: Default::default(),
+            crop: [0.1, 0.0, 0.0, 0.0],
+            ole: None,
+        },
         &CharProps::default(),
     )
     .unwrap();
@@ -186,13 +194,14 @@ fn hostile_documents_export() {
             alt: String::new(),
             float: Default::default(),
             crop: [f32::NAN; 4],
+            ole: None,
         },
         &CharProps::default(),
     )
     .unwrap();
     p.insert_object(
         0,
-        InlineObject::Image { media: "missing".into(), w: 10.0, h: 10.0, alt: String::new(), float: Default::default(), crop: [0.0; 4] },
+        InlineObject::Image { media: "missing".into(), w: 10.0, h: 10.0, alt: String::new(), float: Default::default(), crop: [0.0; 4], ole: None },
         &CharProps::default(),
     )
     .unwrap();
@@ -212,8 +221,8 @@ fn hostile_documents_export() {
 fn tracked_deletions_are_left_out_without_markup() {
     use wordcraft_doc::{Revision, RevisionKind};
     let mut d = Document::new();
-    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Ada".into(), date: String::new() });
-    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "Ada".into(), date: String::new() });
+    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Ada".into(), date: String::new(), move_name: None });
+    d.revisions.push(Revision { kind: RevisionKind::Insert, author: "Ada".into(), date: String::new(), move_name: None });
     let mut p = Paragraph::with_text("Keep ", CharProps::default());
     let n = p.len();
     p.insert_text(n, "DELETEDTEXT ", &CharProps { del: Some(0), ..Default::default() }).unwrap();
@@ -232,7 +241,7 @@ fn tracked_deletions_are_left_out_without_markup() {
 fn deleted_heading_text_stays_out_of_bookmarks_and_tags() {
     use wordcraft_doc::{Revision, RevisionKind};
     let mut d = Document::new();
-    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Ada".into(), date: String::new() });
+    d.revisions.push(Revision { kind: RevisionKind::Delete, author: "Ada".into(), date: String::new(), move_name: None });
     let del = CharProps { del: Some(0), ..Default::default() };
     // "Intro SECRET Part" with "SECRET " deleted, then a heading deleted as a whole.
     let mut h = Paragraph::with_text("Intro ", CharProps::default()).styled("Heading1");
@@ -291,11 +300,44 @@ fn hidden_heading_text_stays_out_of_bookmarks_and_tags() {
     }
 }
 
+/// The CPU time `f` takes on this thread, in seconds. On Linux it is the scheduler's count of the
+/// time the thread actually ran, so the time it waits while other work on a busy machine has the
+/// CPU is left out; elsewhere, wall-clock time.
+fn cpu_cost(f: &mut impl FnMut()) -> f64 {
+    let ran = || {
+        let s = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        s.split_whitespace().next()?.parse::<u64>().ok()
+    };
+    let (t, before) = (std::time::Instant::now(), ran());
+    f();
+    match (before, ran()) {
+        (Some(a), Some(b)) => b.saturating_sub(a) as f64 * 1e-9,
+        _ => t.elapsed().as_secs_f64(),
+    }
+}
+
+/// How much more `big` costs than `small`, for `big` an input `scale` times the size of `small`'s:
+/// (small, big, big / small), ~`scale` when linear and ~`scale`² when quadratic. Each is the
+/// cheapest of several runs after a warm-up, the runs alternating so a busy spell slows both sizes
+/// alike; `small` is timed `scale` times over per run, so both timings are long against the clock's
+/// resolution.
+fn cost_ratio(scale: usize, mut small: impl FnMut(), mut big: impl FnMut()) -> (f64, f64, f64) {
+    small();
+    big();
+    let mut small_scaled = || (0..scale).for_each(|_| small());
+    let (mut t1, mut tk) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..5 {
+        t1 = t1.min(cpu_cost(&mut small_scaled) / scale as f64);
+        tk = tk.min(cpu_cost(&mut big));
+    }
+    (t1, tk, tk / t1.max(1e-9))
+}
+
 #[test]
 fn long_fragmented_hidden_headings_export_in_linear_time() {
     // Headings of n chars in one-char runs: all hidden with bold alternating, and hidden and visible
     // alternating. Layout and the bookmark/tag titles once scanned every left-out range for every
-    // char, quadratic in n. Machine-independent: the time for 4n against n, linear ~4, quadratic ~16.
+    // char, quadratic in n. Machine-independent: the cost for 8n against n, linear ~8, quadratic ~64.
     let doc = |n: usize| {
         let heading = |visible_every_other: bool| {
             let mut h = Paragraph::with_text(&"abcdefg ".repeat(n / 8), CharProps::default()).styled("Heading1");
@@ -312,23 +354,19 @@ fn long_fragmented_hidden_headings_export_in_linear_time() {
         d
     };
     let opts = PdfOptions { compress: false, ..Default::default() };
-    // The fastest of a few runs, after a warm-up, so one slow run on a busy machine counts less.
-    let fastest = |d: &Document| {
-        (0..3)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                export(d, &opts).unwrap();
-                t.elapsed().as_secs_f64()
-            })
-            .fold(f64::INFINITY, f64::min)
-    };
-    let n = 25_000;
-    let (small, big) = (doc(n), doc(4 * n));
-    export(&small, &opts).unwrap();
-    let (t1, t4) = (fastest(&small), fastest(&big));
-    let ratio = t4 / t1.max(1e-9);
-    eprintln!("t(n) {t1:.3} s, t(4n) {t4:.3} s, ratio {ratio:.1}");
-    assert!(ratio < 8.0, "4x the text took {ratio:.1}x the time ({t1:.3} s → {t4:.3} s): not linear");
+    let n = 12_500;
+    let (small, big) = (doc(n), doc(8 * n));
+    let (t1, t8, ratio) = cost_ratio(
+        8,
+        || {
+            export(&small, &opts).unwrap();
+        },
+        || {
+            export(&big, &opts).unwrap();
+        },
+    );
+    eprintln!("t(n) {t1:.3} s, t(8n) {t8:.3} s, ratio {ratio:.1}");
+    assert!(ratio < 24.0, "8x the text took {ratio:.1}x the time ({t1:.3} s → {t8:.3} s): not linear");
     let pdf = String::from_utf8_lossy(&export(&big, &opts).unwrap()).into_owned();
     // The all-hidden heading has no bookmark; the other is titled with its visible chars only.
     assert!(!pdf.contains("abcd"), "hidden heading text in a title");
@@ -405,7 +443,7 @@ fn fields_put_their_shown_text_in_the_text_layer() {
     // characters, are what copying, search and screen readers get.
     let mut d = Document::new();
     let mut f = Paragraph::with_text("Page  of ", CharProps::default());
-    let field = |instr: &str| InlineObject::Field { instr: instr.into(), result: String::new(), locked: false };
+    let field = |instr: &str| InlineObject::Field { instr: instr.into(), result: String::new(), locked: false, code: false };
     f.insert_object(5, field("PAGE"), &CharProps::default()).unwrap();
     let n = f.len();
     f.insert_object(n, field("NUMPAGES"), &CharProps::default()).unwrap();
@@ -529,7 +567,7 @@ fn field_results_are_extractable_text() {
     let mut p = Paragraph::with_text("See  for details.", CharProps::default());
     p.insert_object(
         4,
-        InlineObject::Field { instr: " REF _RefTarget \\h ".into(), result: "Section 3.01".into(), locked: false },
+        InlineObject::Field { instr: " REF _RefTarget \\h ".into(), result: "Section 3.01".into(), locked: false, code: false },
         &CharProps::default(),
     )
     .unwrap();
@@ -537,6 +575,24 @@ fn field_results_are_extractable_text() {
     let text = extract_text(&export(&d, &PdfOptions::default()).unwrap()).concat();
     assert!(!text.contains('\u{FFFC}'), "{text:?}");
     assert!(squash(&text).contains("See Section 3.01 for details."), "{text:?}");
+}
+
+#[test]
+fn field_result_ligatures_extract_all_their_letters() {
+    // A field result is shaped as one cluster; a ligature in it (Carlito, the Calibri substitute,
+    // joins "ti") used to get only its first letter, shifting the rest: "Sectio  3.01". Bundled
+    // Source Sans 3 joins "fi" and "ffi", so this doesn't depend on the installed fonts.
+    let font = CharProps { font: Some("Source Sans 3".into()), ..Default::default() };
+    let result = "the first office";
+    let face = wordcraft_fonts::FontDb::global().face("Source Sans 3", "Regular");
+    assert!(wordcraft_fonts::shape(&face, result, &[], |c| c).len() < result.chars().count(), "the result has ligatures");
+    let mut d = Document::new();
+    let mut p = Paragraph::with_text("See  here.", font.clone());
+    p.insert_object(4, InlineObject::Field { instr: " REF _RefTarget \\h ".into(), result: result.into(), locked: false, code: false }, &font)
+        .unwrap();
+    d.body = vec![para_block(p)];
+    let text = extract_text(&export(&d, &PdfOptions::default()).unwrap()).concat();
+    assert!(squash(&text).contains("See the first office here."), "{text:?}");
 }
 
 #[test]
@@ -548,4 +604,301 @@ fn synthetic_bold_text_is_extracted_once() {
     d.body = vec![para_block(Paragraph::with_text("Mono bold", bold))];
     let text = squash(&extract_text(&export(&d, &PdfOptions::default()).unwrap()).concat());
     assert!(text.contains("Mono bold"), "{text:?}");
+}
+
+#[test]
+fn turned_cell_text_exports_as_text() {
+    // Table Layout › Text Direction (#226): turned cell text is drawn in a turned frame and
+    // stays real text in the PDF.
+    for dir in [wordcraft_doc::props::TextDirection::Down, wordcraft_doc::props::TextDirection::Up] {
+        let mut t = Table::new(1, 2, 300.0);
+        t.rows[0].cells[0].blocks = vec![para_block(Paragraph::with_text("Turned", CharProps::default()))];
+        t.rows[0].cells[0].props.text_direction = dir;
+        let mut d = Document::new();
+        d.body = vec![Arc::new(Block::Table(t)), para_block(Paragraph::with_text("Below", CharProps::default()))];
+        let text = squash(&extract_text(&export(&d, &PdfOptions::default()).unwrap()).concat());
+        assert!(text.contains("Turned") && text.contains("Below"), "{dir:?}: {text:?}");
+    }
+}
+
+#[test]
+fn inline_chart_is_a_figure_with_its_text_inside_it() {
+    use wordcraft_doc::graphic::{Graphic, GraphicItem, GraphicKind, TextAlign};
+    use wordcraft_doc::props::Rgb;
+    let items = vec![GraphicItem::Text {
+        rect: [0.0, 0.0, 216.0, 20.0],
+        text: "Q1".into(),
+        size: 10.0,
+        color: Rgb::BLACK,
+        bold: false,
+        align: TextAlign::Center,
+        font: None,
+    }];
+    let graphic = Graphic { kind: GraphicKind::Chart, items, ..Default::default() };
+    let obj = InlineObject::Graphic { w: 216.0, h: 144.0, alt: "Sales by quarter".into(), float: Default::default(), graphic: Arc::new(graphic) };
+    let mut d = Document::from_text("Chart");
+    d.insert_object(&wordcraft_doc::Pos::body(0, 0), obj, &Default::default()).unwrap();
+    let raw = |tagged| String::from_utf8_lossy(&export(&d, &PdfOptions { tagged, compress: false, ..Default::default() }).unwrap()).into_owned();
+    assert!(raw(true).contains("/Figure"), "tagged chart is a figure");
+    assert!(!raw(false).contains("/Figure"));
+}
+
+#[test]
+fn chart_without_alt_text_is_a_figure_called_chart() {
+    use wordcraft_doc::graphic::{Graphic, GraphicItem, GraphicKind, PathSeg};
+    let segs = vec![PathSeg::Move(1.0, 1.0), PathSeg::Line(50.0, 50.0)];
+    let items = vec![GraphicItem::Path { segs, fill: None, stroke: Some(wordcraft_doc::props::Rgb::BLACK), stroke_width: 1.0 }];
+    let graphic = Graphic { kind: GraphicKind::Chart, items, ..Default::default() };
+    let obj = InlineObject::Graphic { w: 216.0, h: 144.0, alt: String::new(), float: Default::default(), graphic: Arc::new(graphic) };
+    let mut d = Document::from_text("Chart");
+    d.insert_object(&wordcraft_doc::Pos::body(0, 0), obj, &Default::default()).unwrap();
+    let raw = String::from_utf8_lossy(&export(&d, &PdfOptions { tagged: true, compress: false, ..Default::default() }).unwrap()).into_owned();
+    assert!(raw.contains("/Alt(chart)"), "no chart alt text");
+    assert!(!raw.contains("/Alt(picture)"));
+}
+
+/// A 25 mm square EMF with a red rectangle over its right half (device units 0.04 per 0.01 mm).
+fn red_right_half_emf() -> Vec<u8> {
+    fn rec(typ: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = typ.to_le_bytes().to_vec();
+        v.extend(((8 + payload.len()) as u32).to_le_bytes());
+        v.extend(payload);
+        v
+    }
+    let le32 = |vals: &[i32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let mut h = vec![0u8; 88];
+    h[0..4].copy_from_slice(&1u32.to_le_bytes());
+    h[4..8].copy_from_slice(&88u32.to_le_bytes());
+    h[8..24].copy_from_slice(&le32(&[0, 0, 100, 100]));
+    h[24..40].copy_from_slice(&le32(&[0, 0, 2500, 2500]));
+    h[40..44].copy_from_slice(&0x464D_4520u32.to_le_bytes());
+    h[72..88].copy_from_slice(&le32(&[1000, 1000, 250, 250]));
+    [h, rec(39, &le32(&[1, 0, 0x0000_00FF, 0])), rec(37, &le32(&[1])), rec(43, &le32(&[50, 0, 100, 100])), rec(14, &[0; 12])].concat()
+}
+
+#[test]
+fn metafile_pictures_are_drawn_as_vector_paths() {
+    let mut d = Document::new();
+    let media = d.add_media(red_right_half_emf(), "emf");
+    let mut p = Paragraph::with_text("Figure: ", CharProps::default());
+    let n = p.len();
+    p.insert_object(
+        n,
+        InlineObject::Image { media, w: 70.0, h: 70.0, alt: "red".into(), float: Default::default(), crop: [0.0; 4], ole: None },
+        &CharProps::default(),
+    )
+    .unwrap();
+    d.body = vec![para_block(p)];
+    let bytes = export(&d, &PdfOptions { compress: false, tagged: false, ..Default::default() }).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(raw.contains("1 0 0 rg"), "the red rectangle is filled as a path");
+    assert!(!raw.contains("0.8156"), "the grey placeholder box is not drawn");
+}
+
+/// An EMF file of the given records, with a 25 mm frame and 1000 device pixels across (0.04 per 0.01 mm).
+fn emf_file(records: &[Vec<u8>]) -> Vec<u8> {
+    let le32 = |vals: &[i32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let body = records.concat();
+    let mut h = vec![0u8; 88];
+    h[0..4].copy_from_slice(&1u32.to_le_bytes());
+    h[4..8].copy_from_slice(&88u32.to_le_bytes());
+    h[8..24].copy_from_slice(&le32(&[0, 0, 100, 100]));
+    h[24..40].copy_from_slice(&le32(&[0, 0, 2500, 2500]));
+    h[40..44].copy_from_slice(&0x464D_4520u32.to_le_bytes());
+    h[72..88].copy_from_slice(&le32(&[1000, 1000, 250, 250]));
+    [h, body].concat()
+}
+
+/// One EMF record of the given type with little-endian i32 fields.
+fn emf_rec(typ: u32, fields: &[i32]) -> Vec<u8> {
+    let mut v = typ.to_le_bytes().to_vec();
+    let payload: Vec<u8> = fields.iter().flat_map(|f| f.to_le_bytes()).collect();
+    v.extend(((8 + payload.len()) as u32).to_le_bytes());
+    v.extend(payload);
+    v
+}
+
+#[test]
+fn metafile_strokes_use_round_caps_and_joins() {
+    // A 4-unit black pen (handle 1) outlines a rectangle, so the stroke is drawn with round caps and joins.
+    let recs =
+        [emf_rec(38, &[1, 0, 4, 0, 0]), emf_rec(37, &[1]), emf_rec(37, &[0x8000_0005u32 as i32]), emf_rec(43, &[0, 0, 50, 50]), emf_rec(14, &[0; 3])];
+    let mut d = Document::new();
+    let media = d.add_media(emf_file(&recs), "emf");
+    let mut p = Paragraph::with_text("Figure: ", CharProps::default());
+    let n = p.len();
+    p.insert_object(
+        n,
+        InlineObject::Image { media, w: 70.0, h: 70.0, alt: String::new(), float: Default::default(), crop: [0.0; 4], ole: None },
+        &CharProps::default(),
+    )
+    .unwrap();
+    d.body = vec![para_block(p)];
+    let bytes = export(&d, &PdfOptions { compress: false, tagged: false, ..Default::default() }).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(raw.contains("1 J"), "round line caps");
+    assert!(raw.contains("1 j"), "round line joins");
+}
+
+#[test]
+fn metafile_fill_items_carry_no_stroke_state() {
+    // A stroked outline (NULL brush) followed by a filled rectangle (NULL pen): the fill must not inherit the stroke.
+    let recs = [
+        emf_rec(38, &[1, 0, 4, 0, 0]),
+        emf_rec(37, &[1]),
+        emf_rec(37, &[0x8000_0005u32 as i32]),
+        emf_rec(43, &[0, 0, 50, 50]),
+        emf_rec(39, &[2, 0, 0x0000_00FF, 0]),
+        emf_rec(37, &[2]),
+        emf_rec(37, &[0x8000_0008u32 as i32]),
+        emf_rec(43, &[60, 0, 100, 50]),
+        emf_rec(14, &[0; 3]),
+    ];
+    let mut d = Document::new();
+    let media = d.add_media(emf_file(&recs), "emf");
+    let mut p = Paragraph::with_text("Figure: ", CharProps::default());
+    let n = p.len();
+    p.insert_object(
+        n,
+        InlineObject::Image { media, w: 70.0, h: 70.0, alt: String::new(), float: Default::default(), crop: [0.0; 4], ole: None },
+        &CharProps::default(),
+    )
+    .unwrap();
+    d.body = vec![para_block(p)];
+    let bytes = export(&d, &PdfOptions { compress: false, tagged: false, ..Default::default() }).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    let fill = raw.find("1 0 0 rg").expect("the red fill is drawn");
+    let rest = &raw[fill..];
+    let rest = &rest[..rest.find("endstream").unwrap_or(rest.len())];
+    assert!(raw[..fill].contains("0 0 0 RG"), "the outline is stroked before the fill");
+    assert!(!rest.contains(" RG") && !rest.contains("\nS\n"), "the fill item carries no stroke: {rest:?}");
+}
+
+#[test]
+fn cosmetic_metafile_pens_are_thin_but_visible() {
+    // MOVETO, LINETO with the default cosmetic (width 0) pen: drawn 0.25 pt wide, not 0.1 pt.
+    let recs = [emf_rec(27, &[0, 50]), emf_rec(54, &[100, 50]), emf_rec(14, &[0; 3])];
+    let mut d = Document::new();
+    let media = d.add_media(emf_file(&recs), "emf");
+    let mut p = Paragraph::with_text("Figure: ", CharProps::default());
+    let n = p.len();
+    p.insert_object(
+        n,
+        InlineObject::Image { media, w: 70.0, h: 70.0, alt: String::new(), float: Default::default(), crop: [0.0; 4], ole: None },
+        &CharProps::default(),
+    )
+    .unwrap();
+    d.body = vec![para_block(p)];
+    let bytes = export(&d, &PdfOptions { compress: false, tagged: false, ..Default::default() }).unwrap();
+    let raw = String::from_utf8_lossy(&bytes);
+    assert!(raw.contains("0.25 w"), "the hairline is a quarter point wide");
+}
+
+/// #455: a link to a bookmark after a page break inside its paragraph goes to the page the
+/// bookmark is on, not the paragraph's first page.
+#[test]
+fn bookmark_destination_is_the_page_of_its_start() {
+    let mut d = Document::new();
+    let mut p = Paragraph::with_text("Paragraph start\u{c}Bookmark target", CharProps::default());
+    let at = "Paragraph start\u{c}".len();
+    p.insert_object(at, InlineObject::BookmarkStart { name: "target".into() }, &CharProps::default()).unwrap();
+    p.insert_object(0, InlineObject::BookmarkStart { name: "first".into() }, &CharProps::default()).unwrap();
+    d.body = vec![para_block(p)];
+    let lay = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+    assert_eq!(lay.pages.len(), 2);
+    let pages: Vec<usize> = (0..lay.pages.len()).collect();
+    let outlined = HashSet::new();
+    let ex = Exporter {
+        doc: &d,
+        lay: &lay,
+        opts: &PdfOptions::default(),
+        out_index: pages.iter().enumerate().map(|(o, p)| (*p, o)).collect(),
+        fonts: HashMap::new(),
+        outlined: &outlined,
+        cmaps: HashMap::new(),
+        images: HashMap::new(),
+        vectors: HashMap::new(),
+        tags: Vec::new(),
+        tag_index: HashMap::new(),
+        links: Vec::new(),
+        bookmarks: std::cell::OnceCell::new(),
+    };
+    let (page, x, y) = ex.bookmark("target").unwrap();
+    assert_eq!(page, 1, "the bookmark is on the second page");
+    assert!((x - 72.0).abs() < 1.0 && y < 150.0, "{x} {y}");
+    assert_eq!(ex.bookmark("first").map(|b| b.0), Some(0));
+}
+
+/// Print Markup (#589): the comments and their replies print beside each page, which is scaled
+/// down to keep its paper size; without it they stay out of the PDF.
+#[test]
+fn comments_print_in_balloons_beside_scaled_pages() {
+    let mut d = Document::from_text("Intro line.\nThe quarterly figures look strong.\nClosing line.");
+    let part = d.add_part(wordcraft_doc::PartKind::Comment, vec![para_block(Paragraph::with_text("Check the totals", CharProps::default()))]);
+    d.comments.insert(0, wordcraft_doc::Comment { author: "Ada Reviewer".into(), part, ..Default::default() });
+    let part = d.add_part(wordcraft_doc::PartKind::Comment, vec![para_block(Paragraph::with_text("Totals checked", CharProps::default()))]);
+    d.comments.insert(1, wordcraft_doc::Comment { author: "Ben Editor".into(), part, parent: Some(0), ..Default::default() });
+    d.insert_object(&wordcraft_doc::Pos::body(1, 13), InlineObject::CommentEnd { id: 0 }, &CharProps::default()).unwrap();
+    d.insert_object(&wordcraft_doc::Pos::body(1, 4), InlineObject::CommentStart { id: 0 }, &CharProps::default()).unwrap();
+    let size = |bytes: &[u8]| {
+        let pdf = hayro_syntax::Pdf::new(bytes.to_vec()).expect("parse");
+        pdf.pages().iter().map(|p| p.media_box()).map(|r| (r.width().round(), r.height().round())).collect::<Vec<_>>()
+    };
+    let plain = export(&d, &PdfOptions::default()).unwrap();
+    let text = squash(&extract_text(&plain).concat());
+    assert!(text.contains("quarterly figures") && !text.contains("Check the totals") && !text.contains("Ada Reviewer"), "{text}");
+    let marked = export(&d, &PdfOptions { include_markup: true, comments: true, ..Default::default() }).unwrap();
+    let text = squash(&extract_text(&marked).concat());
+    for want in ["quarterly figures", "Ada Reviewer", "Check the totals", "Ben Editor", "Totals checked"] {
+        assert!(text.contains(want), "{want} missing: {text}");
+    }
+    // Same paper: the page and its markup area are scaled to fit it.
+    assert_eq!(size(&plain), size(&marked));
+    assert_eq!(size(&marked), vec![(612.0, 792.0)]);
+    // Tagged or not, with links and an outline, it still writes.
+    let mut d2 = sample();
+    let part = d2.add_part(wordcraft_doc::PartKind::Comment, vec![para_block(Paragraph::with_text("On the heading", CharProps::default()))]);
+    d2.comments.insert(0, wordcraft_doc::Comment { author: "Ada".into(), part, ..Default::default() });
+    d2.insert_object(&wordcraft_doc::Pos::body(1, 3), InlineObject::CommentStart { id: 0 }, &CharProps::default()).unwrap();
+    for tagged in [false, true] {
+        let bytes = export(&d2, &PdfOptions { tagged, comments: true, ..Default::default() }).unwrap();
+        assert!(squash(&extract_text(&bytes).concat()).contains("On the heading"));
+    }
+}
+
+/// A long document whose every paragraph links to a bookmark (a linked table of contents, cross
+/// references) exports in time proportional to its length: each link looked its bookmark up by
+/// walking the whole document, so NIH's 67-page protocol template took 10.6 s (0.9 s now).
+#[test]
+fn internal_links_export_in_linear_time() {
+    let doc = |n: usize| {
+        let mut d = Document::new();
+        d.body = (0..n)
+            .map(|i| {
+                // Eight links a paragraph, like a dense table of contents or cross-references.
+                let mut p = wordcraft_doc::Paragraph::new();
+                for k in 0..8 {
+                    let link = CharProps { link: Some(format!("#mark{}", (i * 7 + k) % n)), ..CharProps::default() };
+                    p.insert_text(p.len(), &format!("see {k} "), &link).unwrap();
+                }
+                p.insert_object(0, InlineObject::BookmarkStart { name: format!("mark{i}") }, &CharProps::default()).unwrap();
+                para_block(p)
+            })
+            .collect();
+        d
+    };
+    let fastest = |d: &Document| {
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                let bytes = export(d, &PdfOptions::default()).unwrap();
+                assert!(!bytes.is_empty());
+                t.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let (small, big) = (doc(100), doc(400));
+    let _ = export(&small, &PdfOptions::default());
+    let ratio = fastest(&big) / fastest(&small).max(1e-9);
+    assert!(ratio < 9.0, "4x the paragraphs and links took {ratio:.1}x as long (quadratic would be ~16x)");
 }

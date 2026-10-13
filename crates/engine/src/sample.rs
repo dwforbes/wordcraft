@@ -120,7 +120,7 @@ pub fn sample_document() -> Document {
     // Footer: centred page number.
     let mut f = Paragraph::new().styled("Footer");
     f.props.align = Some(Align::Center);
-    let _ = f.insert_object(0, InlineObject::Field { instr: "PAGE".into(), result: "1".into(), locked: false }, &CharProps::default());
+    let _ = f.insert_object(0, InlineObject::Field { instr: "PAGE".into(), result: "1".into(), locked: false, code: false }, &CharProps::default());
     let fid = d.add_part(PartKind::Footer, vec![para_block(f)]);
     d.last_section.footers.default = Some(fid);
     let mut hd = styled("The Open Studio Handbook\t\tSpring edition", "Header");
@@ -209,6 +209,7 @@ mod tests {
 
     #[test]
     fn samples_are_valid() {
+        assert_eq!(sample_document().word_count(), 361);
         for d in [sample_document(), letter(), resume(), report()] {
             assert!(d.word_count() > 5);
             let l = wordcraft_layout::layout(&d, &mut wordcraft_layout::LayoutCache::new(), &Default::default());

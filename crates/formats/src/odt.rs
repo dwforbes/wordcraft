@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use wordcraft_doc::{Align, Document, Rgb};
 
@@ -248,7 +249,7 @@ impl Writer {
                 }
                 Inline::Anchor(a) => out.push_str(&format!("<text:bookmark text:name=\"{}\"/>", x(a))),
                 // Notes aren't written to ODT yet.
-                Inline::Equation { .. } | Inline::Note(_) => {}
+                Inline::Figure(_) | Inline::Equation { .. } | Inline::Note(_) => {}
             }
         }
     }
@@ -631,6 +632,8 @@ struct StyleInfo {
     page_break: bool,
     outline: Option<u8>,
     border_bottom: bool,
+    /// `fo:background-color` of a table-cell style's `style:table-cell-properties`.
+    cell_background: Option<Rgb>,
 }
 
 /// Length → points.
@@ -660,7 +663,8 @@ fn attrs_of(e: &BytesStart<'_>) -> Attrs {
     let mut v = Vec::new();
     for a in e.attributes().with_checks(false).flatten().take(128) {
         let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-        let val = a.unescape_value().map(|c| c.into_owned()).unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+        let val =
+            a.normalized_value(XmlVersion::Explicit1_0).map(|c| c.into_owned()).unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
         v.push((k, val));
     }
     v
@@ -785,6 +789,13 @@ impl Styles {
                         }
                     }
                 }
+                "table-cell-properties" => {
+                    if let Some((_, s)) = &mut cur
+                        && let Some(c) = get(&a, "fo:background-color").and_then(model::parse_color)
+                    {
+                        s.cell_background = Some(c);
+                    }
+                }
                 "paragraph-properties" => {
                     if let Some((_, s)) = &mut cur {
                         s.align = match get(&a, "fo:text-align") {
@@ -860,11 +871,22 @@ impl Styles {
         f
     }
 
-    /// Paragraph kind, alignment, page break, rule and base formatting (automatic styles only).
+    /// Background colour of a table-cell style (whole chain).
+    fn cell_background(&self, name: &str) -> Option<Rgb> {
+        self.chain(name).iter().find_map(|(_, s)| s.cell_background)
+    }
+
+    /// Paragraph kind, alignment, page break, rule and base formatting. The text formatting of
+    /// every style in the chain applies (automatic and common, ODF 1.3 §16.2 inheritance), except
+    /// the style that gives the paragraph its kind and that style's ancestors: their formatting
+    /// is the kind's own look (a heading's size and colour), not direct formatting. `Standard`,
+    /// the default paragraph style, holds document defaults and is left out too.
     fn para(&self, name: &str) -> (Kind, Option<Align>, bool, bool, Fmt) {
         let chain = self.chain(name);
         let mut kind = Kind::Normal;
-        for (n, s) in &chain {
+        let mut kind_at = chain.len();
+        for (i, (n, s)) in chain.iter().enumerate() {
+            kind_at = i;
             let dn = s.display.as_deref().unwrap_or(n).to_ascii_lowercase().replace("_20_", " ");
             let nn = n.to_ascii_lowercase().replace("_20_", " ");
             for cand in [dn.as_str(), nn.as_str()] {
@@ -885,12 +907,13 @@ impl Styles {
                 kind = Kind::Heading(o.min(6));
                 break;
             }
+            kind_at = chain.len();
         }
         let align = chain.iter().find_map(|(_, s)| s.align);
         let pb = chain.iter().take_while(|(_, s)| s.auto).any(|(_, s)| s.page_break);
         let rule = chain.iter().any(|(_, s)| s.border_bottom);
         let mut f = Fmt::default();
-        for (_, s) in chain.iter().rev().filter(|(_, s)| s.auto) {
+        for (_, s) in chain.iter().take(kind_at).rev().filter(|(n, s)| s.auto || *n != "Standard") {
             s.fmt.apply(&mut f);
         }
         (kind, align, pb, rule, f)
@@ -1148,7 +1171,7 @@ impl Body<'_> {
                 self.end_para();
                 let span = get(a, "table:number-columns-spanned").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, 63);
                 let rows = get(a, "table:number-rows-spanned").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, 1000);
-                let shading = get(a, "table:style-name").and_then(|s| self.styles.map.get(s)).and_then(|s| s.fmt.background);
+                let shading = get(a, "table:style-name").and_then(|s| self.styles.cell_background(s));
                 if let Some(t) = self.tables.last_mut() {
                     t.hcover = span as usize - 1;
                 }
@@ -1200,10 +1223,8 @@ impl Body<'_> {
         }
         match local(q) {
             "p" | "h" if !self.in_desc => self.end_para(),
-            "span" | "a" => {
-                if self.fmt.len() > usize::from(self.para.is_some()) {
-                    self.fmt.pop();
-                }
+            "span" | "a" if self.fmt.len() > usize::from(self.para.is_some()) => {
+                self.fmt.pop();
             }
             "list" => {
                 self.end_para();
@@ -1384,7 +1405,63 @@ pub fn parse(bytes: &[u8]) -> Result<Flow, String> {
 
 /// Parse an `.odt` package into a document.
 pub fn import(bytes: &[u8]) -> Result<Document, String> {
-    Ok(model::to_doc(&parse(bytes)?))
+    let mut doc = model::to_doc(&parse(bytes)?);
+    if let Ok(mut z) = zip::ZipArchive::new(Cursor::new(bytes))
+        && let Some(s) = read_entry(&mut z, "styles.xml")
+    {
+        apply_page_layout(&s, &mut doc.last_section);
+    }
+    Ok(doc)
+}
+
+/// Read the page size, orientation and margins of the first master page in `styles.xml` into `sec`.
+fn apply_page_layout(xml: &[u8], sec: &mut wordcraft_doc::SectionProps) {
+    let mut layouts: HashMap<String, Attrs> = HashMap::new();
+    let mut cur: Option<String> = None;
+    let mut master: Option<String> = None;
+    events(xml, |ev| match ev {
+        Ev::Start(q, a) => match local(&q) {
+            "page-layout" if q.starts_with("style:") => cur = get(&a, "style:name").map(String::from),
+            "page-layout-properties" => {
+                if let Some(n) = &cur {
+                    layouts.insert(n.clone(), a);
+                }
+            }
+            "master-page" if master.is_none() => master = get(&a, "style:page-layout-name").map(String::from),
+            _ => {}
+        },
+        Ev::End(q) => {
+            if local(&q) == "page-layout" {
+                cur = None;
+            }
+        }
+        Ev::Text(_) => {}
+    });
+    let Some(a) = master.and_then(|m| layouts.remove(&m)) else { return };
+    let len = |k: &str| get(&a, k).and_then(length).filter(|v| *v >= 0.0);
+    // Like the DOCX reader: a page is at least half an inch; at most 22 inches (Word's limit), so a hostile
+    // `1e30pt` can't reach layout.
+    let page = |k: &str| len(k).filter(|v| *v >= 36.0).map(|v| v.min(1584.0));
+    if let (Some(w), Some(h)) = (page("fo:page-width"), page("fo:page-height")) {
+        sec.page_w = w;
+        sec.page_h = h;
+    }
+    sec.landscape = match get(&a, "style:print-orientation") {
+        Some("landscape") => true,
+        Some("portrait") => false,
+        _ => sec.page_w > sec.page_h,
+    };
+    for (k, slot) in [
+        ("fo:margin-top", &mut sec.margin_top),
+        ("fo:margin-bottom", &mut sec.margin_bottom),
+        ("fo:margin-left", &mut sec.margin_left),
+        ("fo:margin-right", &mut sec.margin_right),
+    ] {
+        if let Some(v) = len(k) {
+            // No margin is larger than the page's longer side (as `w:pgMar` in the DOCX reader).
+            *slot = v.min(sec.page_w.max(sec.page_h));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1402,5 +1479,119 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse(b"not a zip").is_err());
+    }
+
+    const NS_T: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0""#;
+
+    /// A package with `content.xml` and, when given, `styles.xml`.
+    fn package(content: &str, styles: Option<&str>) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in
+            [("mimetype", "application/vnd.oasis.opendocument.text"), ("content.xml", content)].into_iter().chain(styles.map(|s| ("styles.xml", s)))
+        {
+            z.start_file(name, o).unwrap();
+            z.write_all(data.as_bytes()).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    fn paras(f: &Flow) -> Vec<&Para> {
+        f.blocks.iter().filter_map(|b| if let FBlock::Para(p) = b { Some(p) } else { None }).collect()
+    }
+
+    #[test]
+    fn common_paragraph_styles_give_text_formatting() {
+        // #436: a common paragraph style's text properties reach its paragraphs, directly,
+        // through a derived common style and through an automatic style's parent.
+        let props = r##"<style:text-properties fo:font-weight="bold" fo:color="#ff0000" fo:font-size="24pt"/>"##;
+        let styles = format!(
+            r#"<office:document-styles {NS_T}><office:styles><style:style style:name="Standard" style:family="paragraph"/><style:style style:name="Emphasis" style:family="paragraph" style:parent-style-name="Standard">{props}</style:style><style:style style:name="Derived" style:family="paragraph" style:parent-style-name="Emphasis"/></office:styles></office:document-styles>"#
+        );
+        let content = format!(
+            r#"<office:document-content {NS_T}><office:automatic-styles><style:style style:name="Bridge" style:family="paragraph" style:parent-style-name="Emphasis"/></office:automatic-styles><office:body><office:text><text:p>Plain</text:p><text:p text:style-name="Emphasis">Common</text:p><text:p text:style-name="Derived">Derived</text:p><text:p text:style-name="Bridge">Bridge</text:p></office:text></office:body></office:document-content>"#
+        );
+        let f = parse(&package(&content, Some(&styles))).unwrap();
+        let ps = paras(&f);
+        assert_eq!(ps.len(), 4);
+        let fmt = |p: &Para| p.inlines.iter().find_map(|i| if let Inline::Text(_, f) = i { Some(f.clone()) } else { None }).unwrap();
+        assert_eq!(fmt(ps[0]), Fmt::default());
+        for p in &ps[1..] {
+            let f = fmt(p);
+            assert!(f.bold && f.color == Some(Rgb(255, 0, 0)) && f.size == Some(24.0), "{}: {f:?}", p.text());
+        }
+    }
+
+    #[test]
+    fn page_size_orientation_and_margins_round_trip() {
+        // #810: the page setup written on export is read back on import.
+        let mut doc = Document::new();
+        doc.last_section.page_w = 841.0;
+        doc.last_section.page_h = 595.0;
+        doc.last_section.landscape = true;
+        doc.last_section.margin_left = 36.0;
+        doc.last_section.margin_top = 54.0;
+        let back = import(&export(&doc).unwrap()).unwrap();
+        let s = &back.last_section;
+        assert!(s.landscape);
+        assert_eq!((s.page_w, s.page_h), (841.0, 595.0));
+        assert_eq!((s.margin_left, s.margin_top), (36.0, 54.0));
+    }
+
+    #[test]
+    fn page_layout_follows_the_first_master_page() {
+        let xml = br#"<office:document-styles><office:automatic-styles>
+            <style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"/></style:page-layout>
+            <style:page-layout style:name="pm2">
+            <style:page-layout-properties fo:page-width="10in" fo:page-height="5in" fo:margin-left="1in" style:print-orientation="landscape"/>
+            </style:page-layout>
+            </office:automatic-styles><office:master-styles>
+            <style:master-page style:name="Standard" style:page-layout-name="pm2"/>
+            <style:master-page style:name="Other" style:page-layout-name="pm1"/>
+            </office:master-styles></office:document-styles>"#;
+        let mut sec = wordcraft_doc::SectionProps::default();
+        apply_page_layout(xml, &mut sec);
+        assert!(sec.landscape);
+        assert_eq!((sec.page_w, sec.page_h, sec.margin_left, sec.margin_top), (720.0, 360.0, 72.0, 72.0));
+    }
+
+    #[test]
+    fn hostile_page_layout_values_are_clamped() {
+        let styles = |w: &str, h: &str, m: &str| {
+            format!(
+                r#"<office:document-styles><office:automatic-styles><style:page-layout style:name="pm1">
+                <style:page-layout-properties fo:page-width="{w}" fo:page-height="{h}" fo:margin-top="{m}"
+                fo:margin-bottom="{m}" fo:margin-left="{m}" fo:margin-right="{m}"/></style:page-layout>
+                </office:automatic-styles><office:master-styles>
+                <style:master-page style:name="Standard" style:page-layout-name="pm1"/></office:master-styles>
+                </office:document-styles>"#
+            )
+        };
+        // Huge values: the page is capped at 22 inches and margins at the page's longer side.
+        let mut sec = wordcraft_doc::SectionProps::default();
+        apply_page_layout(styles("1e30pt", "1e30in", "1e30pt").as_bytes(), &mut sec);
+        assert_eq!((sec.page_w, sec.page_h), (1584.0, 1584.0));
+        assert_eq!((sec.margin_top, sec.margin_left), (1584.0, 1584.0));
+        // Negative, zero, tiny and non-numeric values leave the defaults alone.
+        let def = wordcraft_doc::SectionProps::default();
+        for (w, h, m) in [("-10in", "-5in", "-1in"), ("0pt", "0pt", "NaNpt"), ("1pt", "2pt", "infpt"), ("NaN", "inf", "x")] {
+            let mut sec = wordcraft_doc::SectionProps::default();
+            apply_page_layout(styles(w, h, m).as_bytes(), &mut sec);
+            assert_eq!((sec.page_w, sec.page_h), (def.page_w, def.page_h), "{w} {h}");
+            assert_eq!((sec.margin_top, sec.margin_right), (def.margin_top, def.margin_right), "{m}");
+            assert!(sec.page_w.is_finite() && sec.margin_left.is_finite());
+        }
+    }
+
+    #[test]
+    fn table_cell_style_background_is_shading() {
+        // #437: `fo:background-color` on `style:table-cell-properties` is the cell's shading.
+        let content = format!(
+            r##"<office:document-content {NS_T}><office:automatic-styles><style:style style:name="RedCell" style:family="table-cell"><style:table-cell-properties fo:background-color="#ff0000"/></style:style></office:automatic-styles><office:body><office:text><table:table><table:table-column table:number-columns-repeated="2"/><table:table-row><table:table-cell table:style-name="RedCell"><text:p>Red</text:p></table:table-cell><table:table-cell><text:p>Plain</text:p></table:table-cell></table:table-row></table:table></office:text></office:body></office:document-content>"##
+        );
+        let f = parse(&package(&content, None)).unwrap();
+        let Some(FBlock::Table(t)) = f.blocks.iter().find(|b| matches!(b, FBlock::Table(_))) else { panic!("no table") };
+        let row: Vec<_> = t.rows[0].iter().map(|c| (c.text(), c.shading)).collect();
+        assert_eq!(row, vec![("Red".to_string(), Some(Rgb(255, 0, 0))), ("Plain".to_string(), None)]);
     }
 }

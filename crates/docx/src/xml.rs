@@ -4,8 +4,9 @@
 //! `r:id`, `a:blip`…), so the reader doesn't care which prefixes a producer chose. Names in
 //! unknown namespaces keep their local name behind a `?:` prefix.
 
+use quick_xml::XmlVersion;
 use quick_xml::events::Event;
-use quick_xml::name::ResolveResult;
+use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 
 use crate::DocxError;
@@ -21,21 +22,32 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships"),
     ("wp", "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"),
     ("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+    ("c", "http://schemas.openxmlformats.org/drawingml/2006/chart"),
     ("pic", "http://schemas.openxmlformats.org/drawingml/2006/picture"),
     ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
     ("w14", "http://schemas.microsoft.com/office/word/2010/wordml"),
+    ("wpi", "http://schemas.microsoft.com/office/word/2010/wordprocessingInk"),
     ("w15", "http://schemas.microsoft.com/office/word/2012/wordml"),
     ("wp14", "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"),
     ("wps", "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"),
     ("wpg", "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"),
+    ("wpc", "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"),
+    ("dgm", "http://schemas.openxmlformats.org/drawingml/2006/diagram"),
+    ("dsp", "http://schemas.microsoft.com/office/drawing/2008/diagram"),
     ("m", "http://schemas.openxmlformats.org/officeDocument/2006/math"),
     ("v", "urn:schemas-microsoft-com:vml"),
     ("o", "urn:schemas-microsoft-com:office:office"),
     ("w10", "urn:schemas-microsoft-com:office:word"),
 ];
 
+/// The `a:ext` URI under which a drawing is marked decorative ([MS-ODRAWXML]), and the
+/// namespace of its `adec:decorative` element.
+pub const DECORATIVE_EXT: &str = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
+pub const DECORATIVE_NS: &str = "http://schemas.microsoft.com/office/drawing/2017/decorative";
+
 /// Namespaces that only appear in non-body parts.
 const OTHER_NAMESPACES: &[(&str, &str)] = &[
+    ("b", "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"),
     ("rel", "http://schemas.openxmlformats.org/package/2006/relationships"),
     ("ct", "http://schemas.openxmlformats.org/package/2006/content-types"),
     ("cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"),
@@ -58,13 +70,34 @@ const STRICT: &[(&str, &str)] = &[
     ("m", "http://purl.oclc.org/ooxml/officeDocument/math"),
 ];
 
-fn prefix_for(uri: &[u8]) -> &'static str {
+fn prefix_for(uri: &[u8], extra: &[(&'static str, &str)]) -> &'static str {
+    if let Some((p, _)) = extra.iter().find(|(_, u)| u.as_bytes() == uri) {
+        return p;
+    }
     for (p, u) in NAMESPACES.iter().chain(OTHER_NAMESPACES).chain(STRICT) {
         if u.as_bytes() == uri {
             return p;
         }
     }
     "?"
+}
+
+/// Compatibility feature namespaces whose elements are not otherwise handled by this tree.
+/// Keep the reader's existing feature set when canonicalizing `mc:Choice/@Requires` aliases.
+fn requirement_prefix(uri: &[u8]) -> &'static str {
+    let prefix = prefix_for(uri, &[]);
+    if prefix != "?" {
+        return prefix;
+    }
+    match uri {
+        b"http://schemas.microsoft.com/office/drawing/2010/main" => "a14",
+        b"http://schemas.microsoft.com/office/word/2015/wordml/symex" => "w16se",
+        b"http://schemas.microsoft.com/office/word/2016/wordml/cid" => "w16cid",
+        b"http://schemas.microsoft.com/office/word/2018/wordml" => "w16",
+        b"http://schemas.microsoft.com/office/word/2018/wordml/cex" => "w16cex",
+        b"http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash" => "w16sdtdh",
+        _ => "?",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,10 +233,9 @@ impl El {
     }
 }
 
-/// Parse XML bytes into the root element.
 /// UTF-16 LE/BE text with a byte-order mark as UTF-8 (`None` without one). Lossy: an unpaired
 /// surrogate becomes U+FFFD and a trailing odd byte is dropped. The result is at most 1.5× the input.
-fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
+pub(crate) fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
     let (rest, le) = match bytes.get(..2) {
         Some([0xFF, 0xFE]) => (bytes.get(2..)?, true),
         Some([0xFE, 0xFF]) => (bytes.get(2..)?, false),
@@ -213,7 +245,14 @@ fn utf16_to_utf8(bytes: &[u8]) -> Option<String> {
     Some(char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect())
 }
 
+/// Parse XML bytes into the root element.
 pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
+    parse_ns(bytes, &[])
+}
+
+/// [`parse`] with `extra` namespaces (prefix, URI) mapped to canonical prefixes first, so a
+/// related vocabulary (WordprocessingML 2003) reads with the prefixes the reader knows.
+pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, DocxError> {
     // UTF-16 (with a BOM) is transcoded to UTF-8; a UTF-8 BOM is stripped.
     let transcoded = utf16_to_utf8(bytes);
     let bytes = match &transcoded {
@@ -236,7 +275,7 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
         buf.clear();
         let (res, ev) = r.read_resolved_event_into(&mut buf).map_err(|e| DocxError::Xml(e.to_string()))?;
         let el_prefix = match &res {
-            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref())),
+            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref(), extra)),
             _ => None,
         };
         match ev {
@@ -258,15 +297,37 @@ pub fn parse(bytes: &[u8]) -> Result<El, DocxError> {
                     if raw_key == b"xmlns" || raw_key.starts_with(b"xmlns:") {
                         continue;
                     }
-                    let (ares, alocal) = r.resolve_attribute(key);
+                    let (ares, alocal) = r.resolver_mut().resolve_attribute(key);
                     let alocal = String::from_utf8_lossy(alocal.as_ref()).into_owned();
                     let aname = match ares {
-                        ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref())),
+                        ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref(), extra)),
                         _ => alocal,
                     };
-                    let val = match a.unescape_value() {
+                    let val = match a.normalized_value(XmlVersion::Explicit1_0) {
                         Ok(v) => v.into_owned(),
                         Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
+                    };
+                    // Requires contains namespace prefixes, not feature names. Resolve them while
+                    // the namespace scope still exists; declarations are omitted from this tree.
+                    let val = if el.name == "mc:Choice" && aname == "Requires" {
+                        let requirements: Vec<_> = val.split_whitespace().take(65).collect();
+                        if requirements.len() > 64 || requirements.iter().any(|prefix| prefix.len() > 128) {
+                            "?".to_string()
+                        } else {
+                            requirements
+                                .into_iter()
+                                .map(|prefix| {
+                                    let qualified = format!("{prefix}:requirement");
+                                    match r.resolver_mut().resolve_attribute(QName(qualified.as_bytes())).0 {
+                                        ResolveResult::Bound(ns) => requirement_prefix(ns.as_ref()),
+                                        _ => "?",
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }
+                    } else {
+                        val
                     };
                     el.attrs.push((aname, val));
                 }
@@ -470,11 +531,31 @@ mod tests {
     }
 
     #[test]
+    fn choice_requirements_resolve_namespace_aliases_and_rebindings() {
+        let x = br#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:pen="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"><mc:Choice Requires="pen"/><mc:Choice xmlns:pen="urn:future" Requires="pen"/><mc:Choice Requires="undeclared"/></mc:AlternateContent>"#;
+        let e = parse(x).unwrap();
+        let values: Vec<_> = e.children("mc:Choice").map(|c| c.attr("Requires")).collect();
+        assert_eq!(values, [Some("wpi"), Some("?"), Some("?")]);
+    }
+
+    #[test]
     fn deep_nesting_is_error() {
         let mut s = String::new();
         for _ in 0..1000 {
             s.push_str("<a>");
         }
+        assert!(parse(s.as_bytes()).is_err());
+    }
+
+    /// A start tag with thousands of `xmlns:` declarations is refused instead of allocated
+    /// (RUSTSEC-2026-0195: unbounded namespace bindings in the resolver).
+    #[test]
+    fn too_many_namespace_declarations_is_error() {
+        let mut s = String::from("<a xmlns:a0=\"urn:a0\"");
+        for i in 1..10_000 {
+            s.push_str(&format!(" xmlns:a{i}=\"urn:a{i}\""));
+        }
+        s.push_str("><b/></a>");
         assert!(parse(s.as_bytes()).is_err());
     }
 

@@ -95,7 +95,7 @@ Every screenshot below is WordCraft itself, rendered offscreen by its own UI tes
   1.4 ms; pages render on demand.
 - **Everywhere.** One Rust codebase for macOS, Windows, Linux, BSD and the web. No Electron, no
   Tauri: native [egui](https://github.com/emilk/egui) on the GPU.
-- **Built for agents.** Every action is a command with an id. The same 389 commands drive the
+- **Built for agents.** Every action is a command with an id. The same 422 commands drive the
   ribbon, keyboard shortcuts, the command search, a command-line tool, a JSON control channel and
   an MCP server.
 - **Private.** Spelling, grammar and everything else work offline.
@@ -115,13 +115,14 @@ Every screenshot below is WordCraft itself, rendered offscreen by its own UI tes
 | **Pages** | Margins, orientation, size, columns, page/column/section breaks, headers and footers (first page, odd/even), page numbers, watermark, page borders, line numbers, vertical alignment, drop caps, automatic hyphenation |
 | **Objects** | Pictures (resize, crop, recolour, brightness/contrast, transparency, background removal, picture styles, rotate), shapes, text boxes, floating position with text wrapping (square, top and bottom, behind or in front of text) |
 | **References** | Table of contents, footnotes and endnotes, citations and bibliography (APA, MLA, Chicago, IEEE), captions, table of figures, cross-references, index, table of authorities |
-| **Review** | Spelling and grammar with suggestions, thesaurus, word count, comments in margin balloons or a pane, track changes, accept/reject, compare documents, restrict editing, accessibility checker, document inspector |
+| **Review** | Spelling and grammar with suggestions (English and Polish, by each run's language), thesaurus, word count, comments in margin balloons or a pane, track changes, accept/reject, compare documents, restrict editing, accessibility checker, document inspector |
 | **Mailings** | Mail merge from CSV, merge fields, address block, greeting line, rules, preview, finish to a document; envelopes and labels |
-| **View** | Print layout, web layout, draft, read mode, focus, zoom, one/multiple pages, page width, Navigation pane, rulers, gridlines, dark mode; interface in English, 简体中文, 繁體中文, 日本語, Português (Brasil), Español or Українська (follows the system language by default) |
+| **View** | Print layout, web layout, draft, read mode, focus, zoom, one/multiple pages, page width, Navigation pane, rulers, gridlines, dark mode; interface in English, 简体中文, 繁體中文, 日本語, Português (Brasil), Español, Українська, Српски / Srpski, Eesti, Türkçe, Русский, Italiano, Deutsch, Polski, Čeština, Magyar, Français or Български (follows the system language by default) |
 | **Files** | .docx read/write (opens in Word), Word 97-2003 .doc import, PDF export, .odt, .rtf, .html, .md/.mdx, .tex, .txt import/export, page images |
 
-The honest picture, area by area, is in [ROADMAP.md](ROADMAP.md) and the generated
-[feature parity report](docs/parity.md).
+The honest picture, area by area, is in [ROADMAP.md](ROADMAP.md), the
+[parity assessment](docs/target-app-parity.md) and the generated
+[feature checklist](docs/parity-checklist.md).
 
 ## Quick start
 
@@ -150,6 +151,7 @@ WordCraft was designed to be driven by people *and* by AI agents.
 
 ```sh
 claude mcp add wordcraft -- wordcraft-cli mcp                  # headless documents
+# confine the agent to folders: wordcraft-cli mcp --automation-read-root DIR --automation-write-root DIR
 wordcraft --control 7981 &                                     # or drive the running app…
 claude mcp add wordcraft-app -- wordcraft-cli mcp --connect 127.0.0.1:7981
 ```
@@ -187,21 +189,22 @@ covers every target starting with it (`wordcraft*=debug`). The logger is
 | L1 | `wordcraft-doc`, `wordcraft-fonts`, `wordcraft-proof` | document model and editing; fonts and shaping; spelling, grammar, hyphenation |
 | L2 | `wordcraft-layout`, `wordcraft-docx`, `wordcraft-formats` | line breaking, pagination, tables, notes, hit testing; OOXML; ODT/RTF/HTML/Markdown/TXT |
 | L3 | `wordcraft-render`, `wordcraft-pdf` | rasteriser (vello_cpu); PDF (krilla) |
-| L4 | `wordcraft-engine` | session, undo, 389 commands, Word feature catalog |
+| L4 | `wordcraft-engine` | session, undo, 422 commands, Word feature catalog |
 | L5 | `wordcraft-mcp` | MCP server |
 | L6 | `wordcraft-ui-egui` | the Word-style front end (swappable) |
 | apps | `wordcraft`, `wordcraft-cli`, `wordcraft-web` | desktop, command line, browser |
 
-`cargo xtask ci` runs formatting, clippy, ~250 tests, the asset-attribution check, the layering
+`cargo xtask ci` runs formatting, clippy, ~800 tests, the asset-attribution check, the layering
 check and the wasm build. Contributor and agent instructions: [AGENTS.md](AGENTS.md).
 
 ## Roadmap
 
-WordCraft covers 87% of Word's ribbon features with commands today; counting depth and
-fidelity, we estimate about 62% of real feature parity. An alpha for everyday writing is close:
-the remaining work is mostly testing against real-world .docx files, native printing and the
-first signed builds. Charts, SmartArt, the equation editor and the Draw tab come after.
-Details and estimates: [ROADMAP.md](ROADMAP.md).
+WordCraft is in **alpha**. It covers 88% of Word's ribbon features with commands today; counting
+depth, file fidelity, stability and the rest, we estimate it is about 60% of the way to replacing
+all of Word for real work, about 55% for a typical professional's weekly work and about 63% for
+everyday essentials. Beta needs testing against real-world .docx files, keeping charts and SmartArt
+through a round trip, pagination closer to Word's, a stability sweep and native printing. Details
+and estimates: [ROADMAP.md](ROADMAP.md) and [where we fall short](docs/gaps.md).
 
 ## Downloads
 
@@ -232,6 +235,23 @@ Remove-Item Env:WGPU_BACKEND                     # restore the default for later
 An explicit `gl` override can bring the driver crash back on affected systems. The macOS, Linux
 and web backend defaults are unchanged.
 
+The **32-bit** build uses OpenGL even when a DirectX 12 graphics card is present. On 32-bit
+Windows, creating a DirectX 12 graphics pipeline fails immediately and the app exits before the
+window appears. `WGPU_BACKEND=vulkan` (or `dx12`) still overrides that.
+
+**If the app quits right after its window appears with "Parent device is lost" in the log:**
+WordCraft compiles DirectX 12 shaders with FXC, the compiler built into Windows, so it needs no
+`dxcompiler.dll`/`dxil.dll` and ignores any copy another program put on `PATH` (#603).
+`WGPU_DX12_COMPILER` (`fxc`, `dxc`, `auto`) overrides this; with `dxc`, a matching
+`dxcompiler.dll` *and* `dxil.dll` must sit next to `wordcraft.exe`. `WGPU_BACKEND = "vulkan"`
+also avoids DirectX 12 altogether.
+
+**If the app is slow on an older Windows PC:** when DirectX 12 finds no graphics card with a
+driver for it (for example Intel 4th-generation graphics on Windows 11), it only offers Microsoft's
+software renderer, which draws every frame on the processor. In that case WordCraft uses OpenGL
+instead, without setting anything. The log file records the choice (lines starting with
+`graphics:`). `WGPU_BACKEND` still overrides it, e.g. `$env:WGPU_BACKEND = "gl"` or `"dx12"`.
+
 ### macOS
 
 | Build | File | Notes |
@@ -249,6 +269,26 @@ and web backend defaults are unchanged.
 | Fedora/RHEL/openSUSE | `wordcraft-<ver>-linux-x86_64.rpm` | `wordcraft-<ver>-linux-aarch64.rpm` | |
 | Tarball | `wordcraft-<ver>-linux-x86_64.tar.gz` | `wordcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
 
+RISC-V (riscv64): `wordcraft-<ver>-linux-riscv64.tar.gz`, a tarball cross-compiled for glibc 2.39+
+(Ubuntu 24.04, Debian 13 and newer).
+
+**Wayland:** on a Wayland desktop the app runs through XWayland when it is available, because
+winit (the windowing library) supports dragging files into the window only on X11. To use the
+native Wayland backend instead (for example for sharper text with fractional scaling, at the cost
+of file drag-and-drop), start it with `WORDCRAFT_WAYLAND=1`:
+
+```sh
+WORDCRAFT_WAYLAND=1 wordcraft
+```
+
+**Arch Linux (AUR).** Community members maintain three AUR packages; the project doesn't publish
+to the AUR itself. Install one of them:
+| Package | What it installs | Choose it when |
+|---|---|---|
+| [`wordcraft-bin`](https://aur.archlinux.org/packages/wordcraft-bin) | The release tarball above, prebuilt (x86_64, aarch64) | You want the latest release without compiling (quickest) |
+| [`wordcraft`](https://aur.archlinux.org/packages/wordcraft) | The latest release, built from source with `cargo` | You prefer to build releases yourself |
+| [`wordcraft-git`](https://aur.archlinux.org/packages/wordcraft-git) | The current `main` branch, built from source | You want unreleased changes and accept an occasional broken build |
+For example `yay -S wordcraft-bin` or `paru -S wordcraft-bin`.
 ### FreeBSD
 
 | Build | File |
@@ -310,8 +350,10 @@ Copyright (c) 2026 ArtCraft Team and the WordCraft contributors. Required notice
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-The spelling dictionary and hyphenation come from Grady Ward's public-domain Moby Hyphenator II
-word list. The sample documents and templates are original text written for WordCraft.
+The English spelling dictionary and hyphenation come from Grady Ward's public-domain Moby
+Hyphenator II word list. Polish spelling reads the Hunspell `pl_PL` dictionary installed on the system (not bundled) and
+Polish hyphenation the TeX patterns by Hanna Kołodziejska, Bogusław Jackowski and Marek Ryćko (MIT
+option). The sample documents and templates are original text written for WordCraft.
 
 The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
 ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as

@@ -163,6 +163,51 @@ const SNIPPETS: &[&str] = &[
     "<w:sectPr/>",
 ];
 
+#[test]
+fn malformed_or_hostile_bibliography_never_panics() {
+    let doc = format!("<w:document {W_NS}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>");
+    let cases: &[&[u8]] = &[
+        b"<not_sources/>",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><unclosed",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><b:Source/></b:Sources>",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><b:Source><b:Author><b:NameList><b:Person/></b:NameList></b:Author></b:Source></b:Sources>",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><b:Source><b:Tag></b:Tag><b:SourceType></b:SourceType><b:Author><b:NameList><b:Person><b:Last>,,,,</b:Last><b:First></b:First></b:Person></b:NameList></b:Author></b:Source></b:Sources>",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><b:Source><b:Author><b:Editor><b:NameList><b:Person><b:Last>Ed</b:Last></b:Person></b:NameList></b:Editor></b:Author><b:Edition>1st</b:Edition><b:Issue>99</b:Issue><b:Month>13</b:Month><b:Day>32</b:Day><b:YearAccessed>2025</b:YearAccessed><b:MonthAccessed>02</b:MonthAccessed><b:DayAccessed>30</b:DayAccessed><b:StandardNumber>doi:10.0/0</b:StandardNumber></b:Source></b:Sources>",
+        b"<b:Sources xmlns:b=\"http://schemas.openxmlformats.org/officeDocument/2006/bibliography\"><b:Source><b:Tag>Hostile1</b:Tag><b:Editor><b:Person/></b:Editor><b:Accessed>---///---</b:Accessed></b:Source></b:Sources>",
+        b"\xff\xfe<\0b\0:\0S\0",
+    ];
+    let root_rels_bib = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="customXml/item1.xml"/></Relationships>"#;
+    for case in cases {
+        let z = zip(&[("_rels/.rels", root_rels_bib.as_bytes()), ("word/document.xml", doc.as_bytes()), ("customXml/item1.xml", case)]);
+        let res = read(&z);
+        if let Ok(d) = res {
+            let _ = write(&d);
+        }
+    }
+}
+
+/// A file with a huge number of bibliography sources (duplicates and distinct ones) reads in
+/// linear time and keeps at most 10,000 of them.
+#[test]
+fn hostile_bibliography_source_count_is_capped() {
+    let doc = format!("<w:document {W_NS}><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p></w:body></w:document>");
+    let mut sources = String::from(r#"<b:Sources xmlns:b="http://schemas.openxmlformats.org/officeDocument/2006/bibliography" StyleName="MLA">"#);
+    for i in 0..60_000 {
+        sources.push_str(&format!("<b:Source><b:Tag>T{i}</b:Tag><b:Title>Title {i}</b:Title></b:Source>"));
+        // Untagged duplicates all collapse into one source.
+        sources.push_str("<b:Source><b:Title>Same</b:Title></b:Source>");
+    }
+    sources.push_str("</b:Sources>");
+    let root_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="customXml/item1.xml"/></Relationships>"#;
+    let z = zip(&[("_rels/.rels", root_rels.as_bytes()), ("word/document.xml", doc.as_bytes()), ("customXml/item1.xml", sources.as_bytes())]);
+    let start = std::time::Instant::now();
+    let d = read(&z).unwrap();
+    assert_eq!(d.sources.len(), 10_000);
+    assert_eq!(d.sources.iter().filter(|s| s.tag.is_empty()).count(), 1, "untagged duplicates are kept once");
+    assert_eq!(d.settings.bib_style.as_deref(), Some("MLA"));
+    assert!(start.elapsed() < std::time::Duration::from_secs(30), "took {:?}", start.elapsed());
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 300, ..ProptestConfig::default() })]
 

@@ -1,7 +1,7 @@
 //! Sprms → model properties, and style-chain resolution.
 
 use wordcraft_doc::Rgb;
-use wordcraft_doc::props::{Align, CharProps, Highlight, LineSpacing, ParaProps, TextColor, Underline, VertAlign};
+use wordcraft_doc::props::{Align, CharProps, Highlight, LineSpacing, ParaProps, TabAlign, TabLeader, TabStop, TextColor, Underline, VertAlign};
 use wordcraft_doc::styles::{Style, StyleKind, StyleSheet};
 
 use crate::sprm::{self, Prl, Toggle};
@@ -30,6 +30,11 @@ const P_DXA_LEFT80: u16 = 0x840F;
 const P_DXA_RIGHT: u16 = 0x845D;
 const P_DXA_RIGHT80: u16 = 0x840E;
 const P_DXA_FIRST: u16 = 0x8460; // sprmPDxaLeft1
+const P_DXA_FIRST80: u16 = 0x8411; // sprmPDxaLeft1_80
+// Indents in hundredths of a character (sprmPDxcRight, sprmPDxcLeft, sprmPDxcLeft1).
+const P_DXC_RIGHT: u16 = 0x4455;
+const P_DXC_LEFT: u16 = 0x4456;
+const P_DXC_FIRST: u16 = 0x4457;
 const P_DYA_BEFORE: u16 = 0xA413;
 const P_DYA_AFTER: u16 = 0xA414;
 const P_DYA_LINE: u16 = 0x6412;
@@ -182,17 +187,63 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
     }
 }
 
+/// Custom tab stops from `sprmPChgTabsPapx` / `sprmPChgTabs` ([MS-DOC] PChgTabsPapxOperand,
+/// PChgTabsOperand): the stops removed become `Clear` stops (they hide inherited ones) and the
+/// stops added carry their alignment and leader (TBD: jc in bits 0–2, tlc in bits 3–5).
+fn change_tabs(p: &mut ParaProps, prl: &Prl) {
+    let op = prl.operand;
+    let i16_at = |i: usize| op.get(i..i + 2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 20.0);
+    // Both operands start with cb; sprmPChgTabs's removals also carry a "close" distance each.
+    let close = prl.op == sprm::P_CHG_TABS;
+    let mut at = 1;
+    let Some(&del) = op.get(at) else { return };
+    let del = usize::from(del.min(64));
+    at += 1;
+    let mut removed = Vec::with_capacity(del);
+    for k in 0..del {
+        if let Some(x) = i16_at(at + 2 * k) {
+            removed.push(x);
+        }
+    }
+    at += 2 * del * if close { 2 } else { 1 };
+    let Some(&add) = op.get(at) else { return };
+    let add = usize::from(add.min(64));
+    at += 1;
+    let mut tabs = p.tabs.take().unwrap_or_default();
+    // Removed within 25 twips (1.25 pt), as the format says.
+    tabs.retain(|t| !removed.iter().any(|x| (t.pos - x).abs() <= 1.25));
+    for x in removed {
+        tabs.push(TabStop { pos: x, align: TabAlign::Clear, leader: TabLeader::None });
+    }
+    for k in 0..add {
+        let (Some(pos), Some(&tbd)) = (i16_at(at + 2 * k), op.get(at + 2 * add + k)) else { break };
+        let align = match tbd & 7 {
+            1 => TabAlign::Center,
+            2 => TabAlign::Right,
+            3 => TabAlign::Decimal,
+            4 => TabAlign::Bar,
+            _ => TabAlign::Left,
+        };
+        let leader = match (tbd >> 3) & 7 {
+            1 => TabLeader::Dot,
+            2 => TabLeader::Hyphen,
+            3 | 4 => TabLeader::Underscore,
+            5 => TabLeader::MiddleDot,
+            _ => TabLeader::None,
+        };
+        tabs.retain(|t| (t.pos - pos).abs() > 0.05);
+        tabs.push(TabStop { pos, align, leader });
+    }
+    tabs.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+    p.tabs = Some(tabs);
+}
+
 /// Apply a paragraph-property sprm.
 pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
     let tw = |v: i32| (v as f32 / 20.0).clamp(-1000.0, 1000.0);
     let s16 = |prl: &Prl| -> Option<i16> { u16_of(prl).map(|v| v as i16) };
-    let i32of = |prl: &Prl| -> Option<i32> {
-        match prl.operand {
-            [b0, b1, b2, b3, ..] => Some(i32::from_le_bytes([*b0, *b1, *b2, *b3])),
-            _ => None,
-        }
-    };
     match prl.op {
+        sprm::P_CHG_TABS | sprm::P_CHG_TABS_PAPX => change_tabs(p, prl),
         P_JC | P_JC80 => {
             p.align = match prl.operand.first().copied().unwrap_or(0) {
                 1 => Some(Align::Center),
@@ -212,9 +263,20 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 p.indent_right = Some(tw(v as i32));
             }
         }
-        P_DXA_FIRST => {
-            if let Some(v) = i32of(prl) {
-                p.indent_first = Some(tw(v));
+        // A two-byte operand, like the other indents (spra 4).
+        P_DXA_FIRST | P_DXA_FIRST80 => {
+            if let Some(v) = s16(prl) {
+                p.indent_first = Some(tw(v as i32));
+            }
+        }
+        P_DXC_RIGHT | P_DXC_LEFT | P_DXC_FIRST => {
+            if let Some(v) = s16(prl) {
+                let chars = Some(f32::from(v) / 100.0);
+                match prl.op {
+                    P_DXC_RIGHT => p.indent_right_chars = chars,
+                    P_DXC_LEFT => p.indent_left_chars = chars,
+                    _ => p.indent_first_chars = chars,
+                }
             }
         }
         P_DYA_BEFORE => {
@@ -227,13 +289,18 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 p.space_after = Some((v as f32 / 20.0).clamp(0.0, 3168.0));
             }
         }
+        // LSPD ([MS-DOC] §2.9.150): a signed dyaLine, then fMultLinespace. In lines (240ths) when
+        // fMultLinespace is 1; else twips, at least when positive and exactly when negative.
         P_DYA_LINE => {
-            if let Some(v) = u16_of(prl) {
-                let mult = (v & 0x3FFF) as f32;
-                p.line_spacing = Some(match v & 0xC000 {
-                    0x0000 => LineSpacing::Multiple((mult / 240.0).clamp(0.1, 20.0)),
-                    0x8000 => LineSpacing::AtLeast((mult / 20.0).clamp(0.0, 1584.0)),
-                    _ => LineSpacing::Exactly((mult / 20.0).clamp(0.0, 1584.0)),
+            if let Some(v) = s16(prl) {
+                let mult = prl.operand.get(2..4).is_some_and(|b| b == [1, 0]);
+                let v = f32::from(v);
+                p.line_spacing = Some(if mult {
+                    LineSpacing::Multiple((v.abs() / 240.0).clamp(0.06, 132.0))
+                } else if v < 0.0 {
+                    LineSpacing::Exactly((-v / 20.0).clamp(0.7, 1584.0))
+                } else {
+                    LineSpacing::AtLeast((v / 20.0).clamp(0.0, 1584.0))
                 });
             }
         }
@@ -281,22 +348,14 @@ pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Sty
             4 => StyleKind::Numbering,
             _ => StyleKind::Paragraph,
         };
-        let base = st
-            .istd_base
-            .checked_sub(1)
-            .filter(|&i| (i as usize) < istd && raw.get(i as usize).is_some_and(|b| !b.name.is_empty()))
-            .map(|i| style_id(&raw[i as usize].name));
-        // Inherit: character props come from the base chain, then our own chpx.
+        let base = base_of(raw, istd).and_then(|i| raw.get(i)).map(|b| style_id(&b.name));
+        // Inherit: properties come from the base chain, root first, then our own grpprls.
         let mut chr = CharProps::default();
-        if let Some(b) = st.istd_base.checked_sub(1).filter(|&i| (i as usize) < istd).and_then(|i| raw.get(i as usize)) {
-            apply_chain(&mut chr, &b.chpx, fonts);
-        }
-        apply_chain(&mut chr, &st.chpx, fonts);
         let mut para = ParaProps::default();
-        if let Some(b) = st.istd_base.checked_sub(1).filter(|&i| (i as usize) < istd).and_then(|i| raw.get(i as usize)) {
-            apply_chain_para(&mut para, &b.papx);
+        for s in style_chain(raw, istd).into_iter().filter_map(|i| raw.get(i)) {
+            apply_chain(&mut chr, &s.chpx, fonts);
+            apply_chain_para(&mut para, &s.papx);
         }
-        apply_chain_para(&mut para, &st.papx);
         if para.outline_level.is_none() && kind == StyleKind::Paragraph {
             let h = heading_level(&st.name);
             if h > 0 {
@@ -306,6 +365,34 @@ pub(crate) fn stylesheet(raw: &[crate::stsh::RawStyle], fonts: &[String]) -> Sty
         sheet.styles.push(Style { id, name: display_name(&st.name), kind, based_on: base, chr, para, ..Default::default() });
     }
     sheet
+}
+
+/// Most `istdBase` links followed; a longer chain (or a cycle) in a corrupt file stops there.
+const MAX_STYLE_DEPTH: usize = 16;
+
+/// The parent of style `istd`: its zero-based `istdBase` ([MS-DOC] §2.9.260), when that names
+/// another existing, named style (0x0FFF means none).
+fn base_of(raw: &[crate::stsh::RawStyle], istd: usize) -> Option<usize> {
+    let b = raw.get(istd)?.istd_base;
+    let b = usize::from(b);
+    (b != 0x0FFF && b != istd && raw.get(b).is_some_and(|s| !s.name.is_empty())).then_some(b)
+}
+
+/// Style `istd` and its ancestors, root first and `istd` last. Cycles and chains deeper than
+/// [`MAX_STYLE_DEPTH`] are cut.
+fn style_chain(raw: &[crate::stsh::RawStyle], istd: usize) -> Vec<usize> {
+    let mut chain = vec![istd];
+    let mut cur = istd;
+    while chain.len() < MAX_STYLE_DEPTH {
+        let Some(b) = base_of(raw, cur) else { break };
+        if chain.contains(&b) {
+            break;
+        }
+        chain.push(b);
+        cur = b;
+    }
+    chain.reverse();
+    chain
 }
 
 /// The style-id form of a stored (lower-case) built-in name, matching the docx reader's ids.

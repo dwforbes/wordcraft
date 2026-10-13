@@ -31,11 +31,40 @@ impl Rgb {
 }
 
 /// A text colour: automatic (black on light backgrounds, white on dark) or a fixed colour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Default)]
 pub enum TextColor {
     #[default]
     Auto,
     Rgb(Rgb),
+}
+
+impl TextColor {
+    /// `auto` or `automatic` (any case), or a colour [`Rgb::parse`] reads.
+    pub fn parse(s: &str) -> Option<TextColor> {
+        if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("automatic") { Some(TextColor::Auto) } else { Rgb::parse(s).map(TextColor::Rgb) }
+    }
+}
+
+impl<'de> Deserialize<'de> for TextColor {
+    /// Reads what it writes (`"Auto"`, `{"Rgb": [r, g, b]}`) and also a string [`TextColor::parse`]
+    /// reads, so `styles.modify` and `format.set` take the colours `format.color` takes.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected};
+        #[derive(Deserialize)]
+        enum Written {
+            Auto,
+            Rgb(Rgb),
+        }
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => {
+                TextColor::parse(&s).ok_or_else(|| D::Error::invalid_value(Unexpected::Str(&s), &"`auto`, `RRGGBB` or `#RRGGBB`"))
+            }
+            v => Ok(match serde_json::from_value(v).map_err(D::Error::custom)? {
+                Written::Auto => TextColor::Auto,
+                Written::Rgb(c) => TextColor::Rgb(c),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -281,6 +310,10 @@ pub struct CharProps {
     pub emboss: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engrave: Option<bool>,
+    /// WordArt text effects: fill, outline, shadow, glow, reflection ([MS-DOCX] `w14:` run
+    /// properties). Overlaid effect by effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_effects: Option<Box<crate::wordart::TextEffects>>,
     /// BCP 47 language tag (proofing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
@@ -295,10 +328,14 @@ pub struct CharProps {
     /// Complex-script font (Arabic, Persian, Hebrew…; OOXML `w:rFonts/@w:cs`). `None` = `font`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_cs: Option<String>,
-    /// Complex-script size, points (`w:szCs`). `None` = the same as `size` (see [`CharProps::overlay`]).
+    /// East Asian font (Chinese, Japanese and Korean text; OOXML `w:rFonts/@w:eastAsia`). `None` =
+    /// inherit, then `font`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_ea: Option<String>,
+    /// Complex-script size, points (`w:szCs`). `None` leaves the inherited value unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_cs: Option<f32>,
-    /// Complex-script bold / italic (`w:bCs`, `w:iCs`). `None` = the same as `bold` / `italic`.
+    /// Complex-script bold / italic (`w:bCs`, `w:iCs`). `None` leaves the inherited value unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bold_cs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +352,37 @@ pub struct CharProps {
     /// Tracked deletion: index into `Document::revisions`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub del: Option<u32>,
+    /// Tracked formatting change (`w:rPrChange`): the formatting before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt_change: Option<Box<PropChange<CharProps>>>,
+}
+
+/// A tracked formatting change (ECMA-376 §17.13.5: `w:rPrChange`, `w:pPrChange`,
+/// `w:tblPrChange`, `w:trPrChange`, `w:tcPrChange`, `w:sectPrChange`): the properties as they
+/// were before the change, and the revision (author, date) that made it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PropChange<T> {
+    /// Index into `Document::revisions`.
+    pub rev: u32,
+    /// The properties before the change (formatting only: no revision or link marks).
+    pub old: T,
+}
+
+impl<T> PropChange<T> {
+    pub fn boxed(rev: u32, old: T) -> Option<Box<PropChange<T>>> {
+        Some(Box::new(PropChange { rev, old }))
+    }
+}
+
+/// A tracked change of a paragraph's list numbering (`w:numberingChange`, kept for round trip):
+/// `original` is the number as it was shown before the change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NumChange {
+    /// Index into `Document::revisions`.
+    pub rev: u32,
+    pub original: String,
 }
 
 macro_rules! overlay_fields {
@@ -323,26 +391,42 @@ macro_rules! overlay_fields {
     };
 }
 
+macro_rules! drop_same_fields {
+    ($dst:ident, $base:ident; $($f:ident),*) => {
+        $( if $dst.$f == $base.$f { $dst.$f = None; } )*
+    };
+}
+
 impl CharProps {
+    /// The same formatting outside a hyperlink: no link target, and no "Hyperlink" character
+    /// style that came with it. What a paragraph mark or text typed next to a link gets.
+    pub fn unlinked(&self) -> CharProps {
+        let mut c = self.clone();
+        if c.link.take().is_some() && c.style.as_deref() == Some("Hyperlink") {
+            c.style = None;
+        }
+        c
+    }
+
+    /// The fields of `self` that differ from `base` (equal ones unset): what `self` adds when
+    /// overlaid on `base`.
+    pub fn minus(mut self, base: &CharProps) -> CharProps {
+        drop_same_fields!(self, base; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
+            shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
+            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del);
+        self
+    }
+
     /// Apply every `Some` field of `patch` on top of `self`.
     ///
-    /// Size, bold and italic come in pairs with their complex-script values (Word's own buttons
-    /// set both): a patch that sets the plain value and leaves the complex-script one `None` sets
-    /// both, so a run's size or bold isn't overridden for its Persian/Arabic characters by an
-    /// inherited `w:szCs` / `w:bCs`. The complex-script font inherits on its own (Word often
-    /// sets only the Latin font and lets complex-script text keep the style's).
+    /// Plain and complex-script properties inherit independently. Commands that intend to
+    /// format both scripts must set both values explicitly.
     pub fn overlay(&mut self, patch: &CharProps) {
         overlay_fields!(self, patch; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
             shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
-            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del);
-        if patch.size.is_some() && patch.size_cs.is_none() {
-            self.size_cs = None;
-        }
-        if patch.bold.is_some() && patch.bold_cs.is_none() {
-            self.bold_cs = None;
-        }
-        if patch.italic.is_some() && patch.italic_cs.is_none() {
-            self.italic_cs = None;
+            cs, font_cs, font_ea, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, fmt_change);
+        if let Some(p) = &patch.text_effects {
+            self.text_effects.get_or_insert_with(Default::default).overlay(p);
         }
     }
     pub fn overlaid(mut self, patch: &CharProps) -> CharProps {
@@ -355,7 +439,11 @@ impl CharProps {
     /// Clear direct formatting but keep what isn't "formatting" (links, revisions, character style
     /// is cleared too, as Word's Clear Formatting does).
     pub fn cleared(&self) -> CharProps {
-        CharProps { link: self.link.clone(), ins: self.ins, del: self.del, ..Default::default() }
+        CharProps { link: self.link.clone(), ins: self.ins, del: self.del, fmt_change: self.fmt_change.clone(), ..Default::default() }
+    }
+    /// Just the formatting: without the link, revision marks and tracked formatting change.
+    pub fn formatting(&self) -> CharProps {
+        CharProps { link: None, ins: None, del: None, fmt_change: None, ..self.clone() }
     }
 }
 
@@ -567,6 +655,33 @@ pub struct NumRef {
     pub level: u8,
 }
 
+/// A text frame's placement (`w:framePr`, ECMA-376 §17.3.1.11), in points. Offsets apply when
+/// the matching alignment is unset; anchors and the wrap keep OOXML's names.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TextFrame {
+    /// Width; `None` fits the text.
+    pub w: Option<f32>,
+    /// Height, with `h_exact` exact rather than at least; `None` fits the text.
+    pub h: Option<f32>,
+    pub h_exact: bool,
+    pub x: f32,
+    pub y: f32,
+    /// `left`, `center`, `right`, `inside`, `outside`.
+    pub x_align: Option<String>,
+    /// `top`, `center`, `bottom`, `inside`, `outside` (`inline` is no alignment).
+    pub y_align: Option<String>,
+    /// `text` (the column), `margin` or `page`.
+    pub h_anchor: String,
+    /// `text` (the paragraph), `margin` or `page`.
+    pub v_anchor: String,
+    /// `around`, `auto`, `notBeside`, `none`, `tight` or `through`.
+    pub wrap: String,
+    /// Distance from the text left and right, and above and below.
+    pub h_space: f32,
+    pub v_space: f32,
+}
+
 /// Paragraph formatting. `None` = inherit.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -584,15 +699,38 @@ pub struct ParaProps {
     /// First-line indent, points; negative = hanging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent_first: Option<f32>,
+    /// Left (start) indent in characters (`w:leftChars` / `w:startChars`, stored by Word in
+    /// hundredths). A non-zero value wins over `indent_left`; one character is the size of the
+    /// paragraph mark's font. `Some(0.0)` cancels an inherited value. Common in East Asian documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent_left_chars: Option<f32>,
+    /// Right (end) indent in characters (`w:rightChars` / `w:endChars`), like `indent_left_chars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent_right_chars: Option<f32>,
+    /// First-line indent in characters (`w:firstLineChars`; negative = `w:hangingChars`), like
+    /// `indent_left_chars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent_first_chars: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_before: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_after: Option<f32>,
+    /// HTML-style automatic space before (`w:beforeAutospacing`): 14 pt, none at the top of the
+    /// document or of a table cell, and collapsing with the space after the paragraph above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_before_auto: Option<bool>,
+    /// HTML-style automatic space after (`w:afterAutospacing`): 14 pt, none at the end of a cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_after_auto: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_spacing: Option<LineSpacing>,
     /// Ignore space before/after between paragraphs of the same style.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contextual_spacing: Option<bool>,
+    /// `w:mirrorIndents` (ECMA-376 §17.3.1.18): the left and right indents are the inside and
+    /// outside ones, so they swap sides on even (left-hand) pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_indents: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_next: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -622,13 +760,48 @@ pub struct ParaProps {
     /// Drop cap: lines to drop (0 = none) — applies to the first character(s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drop_cap: Option<u8>,
+    /// A text frame (`w:framePr` other than a drop cap): the paragraph is placed apart from the
+    /// text, which may wrap around it — a footer's page number in a frame, for instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<TextFrame>,
+    /// Asian typography (`w:kinsoku`): East Asian line-breaking rules — no line starts with
+    /// closing punctuation such as 、。」 or ends with opening punctuation such as 「（.
+    /// Unset = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinsoku: Option<bool>,
+    /// `w:wordWrap`: Latin words wrap whole; `false` lets them break at any character (Word's
+    /// "Allow Latin text to wrap in the middle of a word"). Unset = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_wrap: Option<bool>,
+    /// `w:overflowPunct`: punctuation may hang past the line end. Unset = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overflow_punct: Option<bool>,
+    /// `w:topLinePunct`: compress punctuation at the start of a line. Unset = off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_line_punct: Option<bool>,
+    /// `w:autoSpaceDE`: automatic space between Asian and Latin text. Unset = on.
+    #[serde(rename = "autoSpaceDE", skip_serializing_if = "Option::is_none")]
+    pub auto_space_de: Option<bool>,
+    /// `w:autoSpaceDN`: automatic space between Asian text and numbers. Unset = on.
+    #[serde(rename = "autoSpaceDN", skip_serializing_if = "Option::is_none")]
+    pub auto_space_dn: Option<bool>,
+    /// Tracked change of the list numbering (`w:numberingChange`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_change: Option<Box<NumChange>>,
+    /// Tracked formatting change (`w:pPrChange`): the paragraph properties before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt_change: Option<Box<PropChange<ParaProps>>>,
+    /// `w:snapToGrid`: lines snap to the section's document grid. Unset = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snap_to_grid: Option<bool>,
 }
 
 impl ParaProps {
     pub fn overlay(&mut self, patch: &ParaProps) {
-        overlay_fields!(self, patch; style, align, indent_left, indent_right, indent_first, space_before, space_after, line_spacing,
-            contextual_spacing, keep_next, keep_lines, page_break_before, widow_control, outline_level, numbering, tabs, shading, borders,
-            suppress_hyphens, suppress_line_numbers, bidi, drop_cap);
+        overlay_fields!(self, patch; style, align, indent_left, indent_right, indent_first, indent_left_chars, indent_right_chars, indent_first_chars, space_before, space_after, space_before_auto, space_after_auto, line_spacing,
+            contextual_spacing, mirror_indents, keep_next, keep_lines, page_break_before, widow_control, outline_level, numbering, tabs, shading, borders,
+            suppress_hyphens, suppress_line_numbers, bidi, drop_cap, frame, kinsoku, word_wrap, overflow_punct, top_line_punct, auto_space_de, auto_space_dn,
+            snap_to_grid);
     }
     pub fn overlaid(mut self, patch: &ParaProps) -> ParaProps {
         self.overlay(patch);
@@ -636,6 +809,19 @@ impl ParaProps {
     }
     pub fn is_empty(&self) -> bool {
         *self == ParaProps::default()
+    }
+    /// After setting indents in points: keep the indents in characters (left, right, first line)
+    /// an inherited style may set from winning over them, as Word does (`w:firstLineChars="0"`).
+    pub fn cancel_char_indents(&mut self, left: bool, right: bool, first: bool) {
+        for (on, chars) in [(left, &mut self.indent_left_chars), (right, &mut self.indent_right_chars), (first, &mut self.indent_first_chars)] {
+            if on {
+                *chars = Some(0.0);
+            }
+        }
+    }
+    /// Just the formatting: without the tracked changes.
+    pub fn formatting(&self) -> ParaProps {
+        ParaProps { num_change: None, fmt_change: None, ..self.clone() }
     }
 }
 
@@ -646,6 +832,115 @@ pub enum VAlign {
     Top,
     Center,
     Bottom,
+}
+
+/// Which way a table cell's text runs (`w:textDirection`, ECMA-376 §17.4.72).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TextDirection {
+    /// Left to right, lines stacking downwards.
+    #[default]
+    Horizontal,
+    /// Turned 90° clockwise: lines read top to bottom and stack from right to left (`tbRl`).
+    Down,
+    /// Turned 90° counter-clockwise: lines read bottom to top and stack from left to right (`btLr`).
+    Up,
+}
+
+impl TextDirection {
+    /// The direction an OOXML `ST_TextDirection` value names (transitional and strict names).
+    /// The East Asian vertical layouts turn like `Down`; unknown values are horizontal.
+    pub fn from_ooxml(v: &str) -> TextDirection {
+        match v {
+            "tbRl" | "tbRlV" | "tbLrV" | "rl" | "rlV" | "lrV" => TextDirection::Down,
+            "btLr" | "lr" => TextDirection::Up,
+            _ => TextDirection::Horizontal,
+        }
+    }
+    /// The transitional OOXML name.
+    pub fn ooxml(self) -> &'static str {
+        match self {
+            TextDirection::Horizontal => "lrTb",
+            TextDirection::Down => "tbRl",
+            TextDirection::Up => "btLr",
+        }
+    }
+    /// Word's Text Direction button: horizontal → down → up → horizontal.
+    pub fn next(self) -> TextDirection {
+        match self {
+            TextDirection::Horizontal => TextDirection::Down,
+            TextDirection::Down => TextDirection::Up,
+            TextDirection::Up => TextDirection::Horizontal,
+        }
+    }
+    pub fn is_turned(self) -> bool {
+        self != TextDirection::Horizontal
+    }
+}
+
+/// Which way a text box's text runs (Shape Format › Text › Text Direction; DrawingML
+/// `a:bodyPr/@vert`, ECMA-376 §21.1.10.83 `ST_TextVerticalType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TextVert {
+    /// Upright, lines stacking downwards (`horz`).
+    #[default]
+    Horz,
+    /// Turned 90° clockwise (`vert`).
+    Vert,
+    /// Turned 270° (`vert270`).
+    Vert270,
+    /// Upright letters stacked one above the other (`wordArtVert`).
+    Stacked,
+}
+
+impl TextVert {
+    /// The direction an `ST_TextVerticalType` value names; the East Asian and Mongolian vertical
+    /// layouts turn like `vert`, unknown values are horizontal.
+    pub fn from_ooxml(v: &str) -> TextVert {
+        match v {
+            "vert" | "eaVert" | "mongolianVert" => TextVert::Vert,
+            "vert270" => TextVert::Vert270,
+            "wordArtVert" | "wordArtVertRtl" => TextVert::Stacked,
+            _ => TextVert::Horz,
+        }
+    }
+    pub fn ooxml(self) -> &'static str {
+        match self {
+            TextVert::Horz => "horz",
+            TextVert::Vert => "vert",
+            TextVert::Vert270 => "vert270",
+            TextVert::Stacked => "wordArtVert",
+        }
+    }
+    /// How its lines turn on the page (stacked text stays upright).
+    pub fn turn(self) -> TextDirection {
+        match self {
+            TextVert::Vert => TextDirection::Down,
+            TextVert::Vert270 => TextDirection::Up,
+            TextVert::Horz | TextVert::Stacked => TextDirection::Horizontal,
+        }
+    }
+}
+
+/// Where a text box's text sits between its top and bottom (Align Text; `a:bodyPr/@anchor`,
+/// `ST_TextAnchoringType`): reuses [`VAlign`]. Justified and distributed anchoring read as top
+/// and middle.
+pub fn valign_from_anchor(v: &str) -> VAlign {
+    match v {
+        "ctr" | "dist" => VAlign::Center,
+        "b" => VAlign::Bottom,
+        _ => VAlign::Top,
+    }
+}
+
+/// The `ST_TextAnchoringType` value for `a`.
+pub fn anchor_ooxml(a: VAlign) -> &'static str {
+    match a {
+        VAlign::Top => "t",
+        VAlign::Center => "ctr",
+        VAlign::Bottom => "b",
+    }
 }
 
 /// Table-wide properties.
@@ -669,11 +964,22 @@ pub struct TableProps {
     /// column, banded columns.
     pub look: TableLook,
     pub shading: Option<Rgb>,
-    /// Alternative text.
+    /// Alternative text: the title (`w:tblCaption`).
     pub caption: Option<String>,
+    /// Alternative text: the description (`w:tblDescription`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Floating placement (`w:tblpPr`); `None` for a table in the text flow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float: Option<TableFloat>,
+    /// Tracked formatting change (`w:tblPrChange`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt_change: Option<Box<PropChange<TableProps>>>,
+    /// Right-to-left table (`w:bidiVisual`): the first logical column stands at the right edge,
+    /// cell margins and left/right borders mirror, and the alignment and indent are measured from
+    /// the right margin.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bidi_visual: bool,
 }
 
 /// Where a floating table sits; the text after it wraps around it.
@@ -739,6 +1045,9 @@ pub struct RowProps {
     pub header: bool,
     /// Don't let the row break across pages.
     pub cant_split: bool,
+    /// Tracked formatting change (`w:trPrChange`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt_change: Option<Box<PropChange<RowProps>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -757,6 +1066,9 @@ pub enum VMerge {
 pub struct CellProps {
     /// Preferred width, points.
     pub width: Option<f32>,
+    /// Preferred width as a percentage of the table's (`w:tcW w:type="pct"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_pct: Option<f32>,
     /// Number of grid columns spanned (1 = no horizontal merge).
     pub span: u32,
     pub vmerge: VMerge,
@@ -765,9 +1077,16 @@ pub struct CellProps {
     pub valign: VAlign,
     /// Cell margins override (top, left, bottom, right), points.
     pub margins: Option<[f32; 4]>,
-    /// Text direction: false = horizontal, true = rotated (top-to-bottom).
-    pub vertical_text: bool,
+    /// Which way the cell's text runs.
+    pub text_direction: TextDirection,
     pub no_wrap: bool,
+    /// The cell's last paragraph takes no room when it is empty (`w:hideMark`): a row of such
+    /// empty cells shrinks to its borders.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hide_mark: bool,
+    /// Tracked formatting change (`w:tcPrChange`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fmt_change: Option<Box<PropChange<CellProps>>>,
 }
 
 #[cfg(test)]
@@ -816,6 +1135,44 @@ mod tests {
         for h in Highlight::ALL {
             assert_eq!(Highlight::from_ooxml(h.ooxml()), h);
         }
+    }
+
+    #[test]
+    fn text_direction_names() {
+        let mut d = TextDirection::Horizontal;
+        for _ in 0..3 {
+            assert_eq!(TextDirection::from_ooxml(d.ooxml()), d);
+            d = d.next();
+        }
+        assert_eq!(d, TextDirection::Horizontal, "the button cycles through three directions");
+        // Strict names, East Asian vertical layouts and junk.
+        assert_eq!(TextDirection::from_ooxml("rl"), TextDirection::Down);
+        assert_eq!(TextDirection::from_ooxml("lr"), TextDirection::Up);
+        assert_eq!(TextDirection::from_ooxml("tbRlV"), TextDirection::Down);
+        assert_eq!(TextDirection::from_ooxml("tb"), TextDirection::Horizontal);
+        assert_eq!(TextDirection::from_ooxml("lrTbV"), TextDirection::Horizontal);
+        assert_eq!(TextDirection::from_ooxml("é?"), TextDirection::Horizontal);
+    }
+
+    /// #865: a colour reads as `format.color` takes it (`RRGGBB`, `#RRGGBB`, `auto`), while what
+    /// documents and settings already hold reads and writes exactly as before.
+    #[test]
+    fn text_color_reads_hex_and_keeps_its_serialized_forms() {
+        let read = |j: &str| serde_json::from_str::<TextColor>(j);
+        let ink = TextColor::Rgb(Rgb(0x1B, 0x16, 0x11));
+        assert_eq!(read(r#""1B1611""#).unwrap(), ink);
+        assert_eq!(read(r##""#1b1611""##).unwrap(), ink);
+        assert_eq!(read(r#""auto""#).unwrap(), TextColor::Auto);
+        assert_eq!(read(r#""Automatic""#).unwrap(), TextColor::Auto);
+        for (c, j) in [(TextColor::Auto, r#""Auto""#), (ink, r#"{"Rgb":[27,22,17]}"#)] {
+            assert_eq!(serde_json::to_string(&c).unwrap(), j, "written as before");
+            assert_eq!(read(j).unwrap(), c);
+        }
+        for bad in [r#""1B161""#, r#""zzzzzz""#, r#""""#, r#"{"Rgb":"1B1611"}"#, r#"{"Hex":[1,2,3]}"#, "7", "[27,22,17]"] {
+            assert!(read(bad).is_err(), "{bad}");
+        }
+        let p: CharProps = serde_json::from_value(serde_json::json!({"color": "#1B1611", "bold": true})).unwrap();
+        assert_eq!((p.color, p.bold), (Some(ink), Some(true)));
     }
 
     #[test]

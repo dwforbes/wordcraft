@@ -3,7 +3,7 @@ name = "wordcraft-proof"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "WordCraft proofing: spelling (public-domain word list), suggestions, grammar (Harper + own checks), hyphenation"
+description = "WordCraft proofing per language: spelling, suggestions, grammar checks (Harper for English) and hyphenation for English (public-domain word list) and Polish (installed Hunspell dictionary, TeX patterns)"
 
 [lints]
 workspace = true

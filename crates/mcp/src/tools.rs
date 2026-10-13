@@ -4,6 +4,14 @@ use serde_json::{Value, json};
 
 use crate::backend::Backend;
 
+/// An image tool result from a reply carrying base64 PNG in `png`.
+fn png_result(v: &Value, info: &Value) -> ToolResult {
+    match v.get("png").and_then(Value::as_str) {
+        Some(png) if !png.is_empty() => ToolResult::image(png.to_string(), info),
+        _ => ToolResult::error("the reply carried no picture"),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolResult {
     pub content: Vec<Value>,
@@ -80,7 +88,7 @@ pub fn tool_definitions() -> Value {
         tool(
             "open_document",
             "Open",
-            "Open a .docx, .odt, .rtf, .md, .tex, .html, .txt or .json file.",
+            "Open a .docx, .doc, .odt, .rtf, .md, .tex, .html, .txt or .json file, or any other text file (.m3u, .log, .ini…) as plain text.",
             obj(json!({"path": s("File path")}), &["path"]),
             false
         ),
@@ -244,37 +252,19 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "get_text" => wrap(exec(b, "document.text", json!({}))),
         "inspect_document" => wrap(b.call("document.inspect", json!({}))),
         "parity" => wrap(b.call("ui.parity", json!({}))),
+        // Pictures travel inside the reply (`png`), headless or through the app: no file with a
+        // predictable name in the shared temporary folder.
         "render_page" => {
-            if b.has_ui() {
-                let path = std::env::temp_dir().join("wordcraft-mcp-page.png");
-                let path_s = path.to_string_lossy().to_string();
-                match b.call("ui.render", json!({"path": path_s, "page": a.get("page").cloned().unwrap_or(json!(1)), "scale": a.get("scale").cloned().unwrap_or(json!(1.0))})) {
-                    Ok(info) => match std::fs::read(&path) {
-                        Ok(bytes) => ToolResult::image(wordcraft_engine::cmd::insert::base64_encode(&bytes), &info),
-                        Err(e) => ToolResult::error(e.to_string()),
-                    },
-                    Err(e) => ToolResult::error(e),
-                }
-            } else {
-                match b.call("ui.render", a.clone()) {
-                    Ok(v) => {
-                        let png = v.get("png").and_then(Value::as_str).unwrap_or("").to_string();
-                        ToolResult::image(png, &json!({"width": v["width"], "height": v["height"], "pages": v["pages"]}))
-                    }
-                    Err(e) => ToolResult::error(e),
-                }
-            }
-        }
-        "screenshot" => {
-            let path = std::env::temp_dir().join("wordcraft-mcp-shot.png");
-            match b.call("ui.screenshot", json!({"path": path.to_string_lossy()})) {
-                Ok(info) => match std::fs::read(&path) {
-                    Ok(bytes) => ToolResult::image(wordcraft_engine::cmd::insert::base64_encode(&bytes), &info),
-                    Err(e) => ToolResult::error(e.to_string()),
-                },
+            let params = json!({"page": a.get("page").cloned().unwrap_or(json!(1)), "scale": a.get("scale").cloned().unwrap_or(json!(1.0))});
+            match b.call("ui.render", params) {
+                Ok(v) => png_result(&v, &json!({"width": v["width"], "height": v["height"], "pages": v["pages"]})),
                 Err(e) => ToolResult::error(e),
             }
         }
+        "screenshot" => match b.call("ui.screenshot", json!({})) {
+            Ok(v) => png_result(&v, &json!({"width": v["width"], "height": v["height"]})),
+            Err(e) => ToolResult::error(e),
+        },
         "click" => wrap(b.call("ui.click", a.clone())),
         "key" => wrap(b.call("ui.key", a.clone())),
         "ui_inspect" => wrap(b.call("ui.inspect", json!({}))),

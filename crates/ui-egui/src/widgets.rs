@@ -8,12 +8,27 @@ use crate::{WordApp, icons};
 
 /// Height of the ribbon content area (without group labels).
 pub const CONTENT_H: f32 = 66.0;
-pub const LABEL_H: f32 = 16.0;
+/// Height of the group title row under the content.
+pub const LABEL_H: f32 = 18.0;
+/// Large buttons: centre of the 32 px icon, top of the first label line, and the pitch and
+/// height of a label line (`regular(11.5)`; a test checks the font's real line height).
+pub const BIG_ICON_Y: f32 = 18.0;
+pub const BIG_LABEL_Y: f32 = 36.0;
+pub const LABEL_PITCH: f32 = 13.0;
+pub const LABEL_LINE_H: f32 = 14.0;
+// #653: a two-line label ends inside the content, above the group title row.
+const _: () = assert!(BIG_LABEL_Y + LABEL_PITCH + LABEL_LINE_H <= CONTENT_H);
+const _: () = assert!(BIG_ICON_Y + 16.0 <= BIG_LABEL_Y);
 
-/// Shortcut text for a command (`⌘B` on macOS, `Ctrl+B` elsewhere).
+/// Shortcut text for a command (`⌘B` on macOS, `Ctrl+B` elsewhere): its first key in effect,
+/// custom keys included (Customize Keyboard).
 pub fn shortcut_text(app: &WordApp, id: &str) -> String {
-    let Some(spec) = app.session.registry.get(id) else { return String::new() };
-    let sc = spec.shortcut.split(" / ").next().unwrap_or("");
+    let keys = app.session.keymap.keys_for(&app.session.registry, id);
+    keys.first().map(|k| key_text(k)).unwrap_or_default()
+}
+
+/// A key as the platform writes it (`⌘⇧K` on macOS, `Ctrl+Shift+K` elsewhere).
+pub fn key_text(sc: &str) -> String {
     if sc.is_empty() {
         return String::new();
     }
@@ -79,11 +94,12 @@ pub fn enabled(app: &WordApp, id: &str) -> bool {
         Some(s) => (s.enabled)(&app.session).is_none(),
         // Zotero: one command at a time, and only in the desktop app.
         None if id.starts_with("ui.zotero.") => app.zotero.busy.is_none() && !cfg!(target_arch = "wasm32"),
+        None if id == "ui.linkTextBox" => enabled(app, "shape.link"),
         None => id.starts_with("ui."),
     }
 }
 
-fn bg(ui: &Ui, r: Rect, resp: &Response, checked: bool, t: &Tokens) {
+pub(crate) fn bg(ui: &Ui, r: Rect, resp: &Response, checked: bool, t: &Tokens) {
     let fill = if resp.is_pointer_button_down_on() {
         t.pressed
     } else if checked {
@@ -99,8 +115,46 @@ fn bg(ui: &Ui, r: Rect, resp: &Response, checked: bool, t: &Tokens) {
     }
 }
 
+/// Runs a ribbon button's command, then hands keyboard focus back to the document so typing
+/// continues without another click, as in Word (#686). Interface commands (`ui.*`) open dialogs,
+/// panes and tabs that take focus themselves, so they keep it.
+pub(crate) fn run_from_ribbon(app: &mut WordApp, id: &str, params: Value) {
+    let _ = app.run(id, params);
+    if !id.starts_with("ui.") {
+        app.canvas.want_focus = true;
+    }
+}
+
 /// A large ribbon button: 32 px icon over a (possibly two-line) label.
 pub fn big(ui: &mut Ui, app: &mut WordApp, icon: &str, label: &str, id: &str, params: Value, menu: bool) -> Response {
+    big_button(ui, app, icon, label, id, params, menu, false)
+}
+
+/// A large ribbon button for a mode that stays on (`checked` draws it pressed), run without params.
+pub fn big_toggle(ui: &mut Ui, app: &mut WordApp, icon: &str, label: &str, id: &str, checked: bool) -> Response {
+    big_button(ui, app, icon, label, id, Value::Object(Default::default()), false, checked)
+}
+
+/// Size of the drop-down marker drawn after a label or beside a split button (#659: one marker,
+/// the `dropdown` icon, everywhere; no text glyph).
+pub const DROPDOWN: f32 = 10.0;
+
+/// One centred label line (top at `y`); `marker` draws the drop-down icon after the text, in the
+/// text's colour, and the pair is centred together.
+pub fn label_line(ui: &Ui, cx: f32, y: f32, text: &str, font: egui::FontId, color: Color32, marker: bool) {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let extra = if marker { DROPDOWN + 3.0 } else { 0.0 };
+    let size = galley.size();
+    let x = cx - (size.x + extra) / 2.0;
+    ui.painter().galley(pos2(x, y), galley, color);
+    if marker {
+        let c = pos2(x + size.x + 3.0 + DROPDOWN / 2.0, y + size.y / 2.0);
+        icons::paint(ui.painter(), Rect::from_center_size(c, vec2(DROPDOWN, DROPDOWN)), "dropdown", color, color);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn big_button(ui: &mut Ui, app: &mut WordApp, icon: &str, label: &str, id: &str, params: Value, menu: bool, checked: bool) -> Response {
     let label = tl!(label);
     let t = Tokens::get(ui.ctx());
     let galley_w =
@@ -109,20 +163,20 @@ pub fn big(ui: &mut Ui, app: &mut WordApp, icon: &str, label: &str, id: &str, pa
     let (r, resp) = ui.allocate_exact_size(vec2(w, CONTENT_H), Sense::click());
     keytip_badge(ui, r, id, &label.replace('\n', " "));
     let on = enabled(app, id);
-    bg(ui, r, &resp, false, &t);
-    let ic = Rect::from_center_size(pos2(r.center().x, r.min.y + 20.0), vec2(32.0, 32.0));
+    bg(ui, r, &resp, checked, &t);
+    let ic = Rect::from_center_size(pos2(r.center().x, r.min.y + BIG_ICON_Y), vec2(32.0, 32.0));
     let (c, a) = if on { (t.icon, t.accent) } else { (t.text_disabled, t.text_disabled) };
     icons::paint(ui.painter(), ic, icon, c, a);
-    let mut y = r.min.y + 43.0;
+    let mut y = r.min.y + BIG_LABEL_Y;
     let lines: Vec<&str> = label.split('\n').collect();
     for (i, l) in lines.iter().enumerate() {
-        let txt = if menu && i + 1 == lines.len() { format!("{l} ▾") } else { (*l).to_string() };
-        ui.painter().text(pos2(r.center().x, y), Align2::CENTER_TOP, txt, regular(11.5), if on { t.text } else { t.text_disabled });
-        y += 13.0;
+        label_line(ui, r.center().x, y, l, regular(11.5), if on { t.text } else { t.text_disabled }, menu && i + 1 == lines.len());
+        y += LABEL_PITCH;
     }
     let resp = tooltip(app, resp, &label.replace('\n', " "), id);
+    command_menu(&resp, app, id);
     if resp.clicked() && on && !menu {
-        let _ = app.run(id, params);
+        run_from_ribbon(app, id, params);
     }
     resp
 }
@@ -143,9 +197,11 @@ pub fn small(ui: &mut Ui, app: &mut WordApp, icon: &str, label: Option<&str>, ti
         ui.painter().text(pos2(r.min.x + 24.0, r.center().y), Align2::LEFT_CENTER, l, regular(11.5), if on { t.text } else { t.text_disabled });
     }
     let resp = tooltip(app, resp, tip, id);
+    command_menu(&resp, app, id);
     if resp.clicked() && on {
-        let _ = app.run(id, params);
+        run_from_ribbon(app, id, params);
     }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, on, tip));
     resp
 }
 
@@ -173,10 +229,11 @@ pub fn split(
     if let Some(sw) = swatch {
         ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x + 4.0, r.max.y - 5.0), pos2(r.max.x - 4.0, r.max.y - 2.0)), 0.0, sw);
     }
-    icons::paint(ui.painter(), Rect::from_center_size(ar.center(), vec2(10.0, 10.0)), "dropdown", t.icon, t.accent);
+    icons::paint(ui.painter(), Rect::from_center_size(ar.center(), vec2(DROPDOWN, DROPDOWN)), "dropdown", t.icon, t.accent);
     let resp = tooltip(app, resp, tip, id);
+    command_menu(&resp, app, id);
     if resp.clicked() {
-        let _ = app.run(id, params);
+        run_from_ribbon(app, id, params);
     }
     egui::Popup::menu(&aresp).show(|ui| {
         ui.set_min_width(180.0);
@@ -184,7 +241,12 @@ pub fn split(
     });
 }
 
-/// A button that only opens a menu (icon + label + ▾).
+/// Whether a menu button whose menu is about command `id` is on ("" = always).
+pub fn menu_enabled(app: &WordApp, id: &str) -> bool {
+    id.is_empty() || enabled(app, id)
+}
+
+/// A button that only opens a menu (icon + label + drop-down marker).
 pub fn menu_button(
     ui: &mut Ui,
     app: &mut WordApp,
@@ -192,10 +254,15 @@ pub fn menu_button(
     label: Option<&str>,
     tip: &str,
     big_btn: bool,
+    id: &str,
     menu: impl FnOnce(&mut Ui, &mut WordApp),
 ) {
     let (label, tip) = (label.map(|l| tl!(l)), tl!(tip));
     let t = Tokens::get(ui.ctx());
+    // `id` names the command the menu is about (Header for the Header menu…); while it is
+    // disabled the button greys out and doesn't open, like the other ribbon buttons. "" = always on.
+    let on = menu_enabled(app, id);
+    let (c, a, text) = if on { (t.icon, t.accent, t.text) } else { (t.text_disabled, t.text_disabled, t.text_disabled) };
     let resp = if big_btn {
         let galley_w = label
             .unwrap_or("")
@@ -206,13 +273,12 @@ pub fn menu_button(
         let (r, resp) = ui.allocate_exact_size(vec2(w, CONTENT_H), Sense::click());
         keytip_badge(ui, r, "menu", tip);
         bg(ui, r, &resp, false, &t);
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.center().x, r.min.y + 20.0), vec2(32.0, 32.0)), icon, t.icon, t.accent);
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.center().x, r.min.y + BIG_ICON_Y), vec2(32.0, 32.0)), icon, c, a);
         let lines: Vec<&str> = label.unwrap_or("").split('\n').collect();
-        let mut y = r.min.y + 43.0;
+        let mut y = r.min.y + BIG_LABEL_Y;
         for (i, l) in lines.iter().enumerate() {
-            let txt = if i + 1 == lines.len() { format!("{l} ▾") } else { (*l).to_string() };
-            ui.painter().text(pos2(r.center().x, y), Align2::CENTER_TOP, txt, regular(11.5), t.text);
-            y += 13.0;
+            label_line(ui, r.center().x, y, l, regular(11.5), text, i + 1 == lines.len());
+            y += LABEL_PITCH;
         }
         resp
     } else {
@@ -220,40 +286,60 @@ pub fn menu_button(
         let (r, resp) = ui.allocate_exact_size(vec2(24.0 + text_w + 10.0, 22.0), Sense::click());
         keytip_badge(ui, r, "menu", tip);
         bg(ui, r, &resp, false, &t);
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 12.0, r.center().y), vec2(17.0, 17.0)), icon, t.icon, t.accent);
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 12.0, r.center().y), vec2(17.0, 17.0)), icon, c, a);
         if let Some(l) = label {
-            ui.painter().text(pos2(r.min.x + 24.0, r.center().y), Align2::LEFT_CENTER, l, regular(11.5), t.text);
+            ui.painter().text(pos2(r.min.x + 24.0, r.center().y), Align2::LEFT_CENTER, l, regular(11.5), text);
         }
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.max.x - 6.0, r.center().y), vec2(9.0, 9.0)), "dropdown", t.icon, t.accent);
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(r.max.x - 6.0, r.center().y), vec2(DROPDOWN, DROPDOWN)), "dropdown", c, c);
         resp
     };
     let resp = resp.on_hover_text(tip);
+    if !on {
+        return;
+    }
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(200.0);
         menu(ui, app);
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Groups drawn taller than [`CONTENT_H`] (title and height): their content runs into the
+    /// group label below, as View › Show did with four check boxes in one column.
+    pub(crate) static TALL_GROUPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A ribbon group: content, a centred label below and a divider on the right.
 pub fn group(ui: &mut Ui, title: &str, launcher: Option<&str>, app: &mut WordApp, add: impl FnOnce(&mut Ui, &mut WordApp)) {
     // The English title keys the launcher's id; the drawn title is translated.
-    let id_title = title;
-    let title = tl!(title);
+    group_titled(ui, title, tl!(title), launcher, app, add);
+}
+
+/// A ribbon group whose title is shown as is (a custom group's name, Customize Ribbon).
+pub fn group_titled(ui: &mut Ui, id_title: &str, title: &str, launcher: Option<&str>, app: &mut WordApp, add: impl FnOnce(&mut Ui, &mut WordApp)) {
     let t = Tokens::get(ui.ctx());
     let label_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(title.to_string(), regular(11.0), t.group_label).size().x);
     let start = ui.cursor().min;
     let inner = ui.vertical(|ui| {
         ui.set_min_width(label_w + if launcher.is_some() { 22.0 } else { 10.0 });
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTENT_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+        let content = ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTENT_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
             add(ui, app);
         });
+        #[cfg(test)]
+        if content.response.rect.height() > CONTENT_H + 0.5 {
+            TALL_GROUPS.with(|g| g.borrow_mut().push(format!("{id_title}: {:.1}", content.response.rect.height())));
+        }
+        #[cfg(not(test))]
+        let _ = content;
     });
     let r = inner.response.rect;
     let r = Rect::from_min_max(start, pos2(r.max.x, start.y + CONTENT_H + LABEL_H));
-    ui.painter().text(pos2(r.center().x, r.max.y - 8.0), Align2::CENTER_CENTER, title, regular(11.0), t.group_label);
+    let title_y = r.max.y - LABEL_H / 2.0;
+    ui.painter().text(pos2(r.center().x, title_y), Align2::CENTER_CENTER, title, regular(11.0), t.group_label);
     if let Some(cmd) = launcher {
-        let lr = Rect::from_center_size(pos2(r.max.x - 6.0, r.max.y - 8.0), vec2(11.0, 11.0));
+        let lr = Rect::from_center_size(pos2(r.max.x - 6.0, title_y), vec2(11.0, 11.0));
         let resp = ui.interact(lr, ui.id().with(("launch", id_title)), Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(lr.expand(2.0), 2.0, t.hover);
@@ -267,6 +353,69 @@ pub fn group(ui: &mut Ui, title: &str, launcher: Option<&str>, app: &mut WordApp
     let x = ui.cursor().min.x;
     ui.painter().line_segment([pos2(x, start.y + 4.0), pos2(x, start.y + CONTENT_H + LABEL_H - 4.0)], Stroke::new(1.0, t.border));
     ui.add_space(6.0);
+}
+
+/// The icon a command's button shows outside its own ribbon group (custom groups, the Quick
+/// Access Toolbar): the one its ribbon button uses, which is usually named after the id's last
+/// part. Names the icon set doesn't have draw a lettered tile ([`icons::paint`]).
+pub fn command_icon(id: &str) -> &str {
+    const ICONS: &[(&str, &str)] = &[
+        ("arrange.wrap", "wrapText"),
+        ("draw.highlighter", "highlight"),
+        ("format.border", "charborder"),
+        ("format.color", "fontcolor"),
+        ("format.growFont", "grow"),
+        ("format.shrinkFont", "shrink"),
+        ("format.strikethrough", "strike"),
+        ("format.highlight", "highlight"),
+        ("insert.signatureLine", "signature"),
+        ("mailings.envelopes", "envelope"),
+        ("mailings.insertField", "mergeField"),
+        ("para.ltr", "textLtr"),
+        ("para.rtl", "textRtl"),
+        ("para.bullets", "bullets"),
+        ("para.numbering", "numbering"),
+        ("table.insertRowAbove", "insertAbove"),
+        ("view.commentsPane", "showComments"),
+        ("view.marks", "pilcrow"),
+        ("edit.repeat", "redo"),
+        ("file.new", "blankPage"),
+        ("tools.customizeRibbon", "more"),
+    ];
+    ICONS.iter().find(|(c, _)| *c == id).map_or_else(|| id.rsplit('.').next().unwrap_or(id), |(_, icon)| *icon)
+}
+
+/// Right-click on a command's button: put it on (or take it off) the Quick Access Toolbar, or
+/// open Customize Ribbon (#379).
+pub fn command_menu(resp: &Response, app: &mut WordApp, id: &str) {
+    resp.context_menu(|ui| {
+        let known = app.session.registry.get(id).is_some();
+        let on_qat = app.session.ribbon.qat().contains(&id);
+        if known && !on_qat && ui.button(tl!("Add to Quick Access Toolbar")).clicked() {
+            let _ = app.run("tools.customizeRibbon", serde_json::json!({"qatAdd": id}));
+            ui.close();
+        }
+        if on_qat && ui.button(tl!("Remove from Quick Access Toolbar")).clicked() {
+            let _ = app.run("tools.customizeRibbon", serde_json::json!({"qatRemove": id}));
+            ui.close();
+        }
+        if known {
+            ui.separator();
+        }
+        customize_menu_items(ui, app);
+    });
+}
+
+/// "Customize the Ribbon…" and "Customize Quick Access Toolbar…" (context menus).
+pub fn customize_menu_items(ui: &mut Ui, app: &mut WordApp) {
+    if ui.button(tl!("Customize the Ribbon…")).clicked() {
+        crate::dialogs_ribbon::open(app, crate::dialogs_ribbon::Page::Ribbon);
+        ui.close();
+    }
+    if ui.button(tl!("Customize Quick Access Toolbar…")).clicked() {
+        crate::dialogs_ribbon::open(app, crate::dialogs_ribbon::Page::QuickAccess);
+        ui.close();
+    }
 }
 
 /// A row of small buttons (used inside a vertical stack).
@@ -314,7 +463,7 @@ pub fn color_grid(ui: &mut Ui, theme: &[wordcraft_doc::Rgb]) -> Option<String> {
     picked
 }
 
-fn swatch(ui: &mut Ui, c: wordcraft_doc::Rgb) -> bool {
+pub(crate) fn swatch(ui: &mut Ui, c: wordcraft_doc::Rgb) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::click());
     ui.painter().rect_filled(r, 0.0, Color32::from_rgb(c.0, c.1, c.2));
     let t = Tokens::get(ui.ctx());
@@ -327,7 +476,8 @@ fn swatch(ui: &mut Ui, c: wordcraft_doc::Rgb) -> bool {
     resp.on_hover_text(format!("#{}", c.hex())).clicked()
 }
 
-/// A ribbon-style text field with a dropdown list. Returns a chosen/typed value.
+/// A ribbon-style text field with a dropdown list. Returns a chosen/typed value; Enter commits
+/// the typed text as is (the font size box relies on that: "1" must not become "10").
 pub fn combo(
     ui: &mut Ui,
     id: &str,
@@ -336,41 +486,501 @@ pub fn combo(
     items: &[String],
     preview: Option<&dyn Fn(&mut Ui, &str) -> Response>,
 ) -> Option<String> {
+    combo_impl(ui, id, width, current, items, preview, false)
+}
+
+/// What [`font_combo`] returns when its list's last entry, Add Font…, is chosen (#582): the
+/// caller runs `font.add`, which shows a file picker. Not a family name anyone can type.
+pub const ADD_FONT: &str = "\u{1}font.add";
+
+/// The font box: a [`combo`] where typing lists the matching families under the field (#359).
+/// Its list ends with Add Font… ([`ADD_FONT`]).
+/// Up/Down move the highlight, Enter or a click applies the highlighted family ("arial" applies
+/// "Arial"), Escape restores the current font. Text matching no family is applied as typed, as
+/// Word allows fonts that are not installed.
+pub fn font_combo(
+    ui: &mut Ui,
+    id: &str,
+    width: f32,
+    current: &str,
+    items: &[String],
+    preview: Option<&dyn Fn(&mut Ui, &str) -> Response>,
+) -> Option<String> {
+    combo_impl(ui, id, width, current, items, preview, true)
+}
+
+/// Indices of the `items` matching `query`, ignoring case: exact matches, then the names starting
+/// with it, then those containing it, each group in list order. A blank query matches everything.
+pub fn font_matches(query: &str, items: &[String]) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let (mut exact, mut prefix, mut inner) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, it) in items.iter().enumerate() {
+        let name = it.to_lowercase();
+        if name == q {
+            exact.push(i);
+        } else if name.starts_with(&q) {
+            prefix.push(i);
+        } else if name.contains(&q) {
+            inner.push(i);
+        }
+    }
+    exact.extend(prefix);
+    exact.extend(inner);
+    exact
+}
+
+/// A searching combo's state between frames.
+#[derive(Clone, Default)]
+struct ComboSearch {
+    /// The match list is showing (the user typed since focusing the field).
+    open: bool,
+    /// The query `matches` were computed for, and the list length then.
+    query: String,
+    items_len: usize,
+    matches: std::sync::Arc<Vec<usize>>,
+    /// Index into `matches`.
+    highlight: usize,
+    /// Where the list was drawn last frame, its scroll offset and visible height.
+    popup: Option<Rect>,
+    offset: f32,
+    view_h: f32,
+}
+
+fn combo_impl(
+    ui: &mut Ui,
+    id: &str,
+    width: f32,
+    current: &str,
+    items: &[String],
+    preview: Option<&dyn Fn(&mut Ui, &str) -> Response>,
+    search: bool,
+) -> Option<String> {
     let mut out = None;
     let edit_id = ui.id().with(("combo_text", id));
+    let te_id = ui.id().with(("combo_edit", id));
+    let search_id = ui.id().with(("combo_search", id));
     let mut text = ui.data_mut(|d| d.get_temp::<String>(edit_id)).unwrap_or_else(|| current.to_string());
+    let mut s: ComboSearch = if search { ui.data_mut(|d| d.get_temp(search_id)).unwrap_or_default() } else { ComboSearch::default() };
+    let mut focused = false;
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-        let te = egui::TextEdit::singleline(&mut text).desired_width(width - 16.0).font(regular(12.0)).margin(vec2(4.0, 3.0));
+        // Up/Down move the list's highlight: take them before the text field moves its cursor.
+        let mut step = 0i32;
+        if s.open && ui.memory(|m| m.has_focus(te_id)) {
+            ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    step += 1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    step -= 1;
+                }
+            });
+        }
+        let te = egui::TextEdit::singleline(&mut text).id(te_id).desired_width(width - 16.0).font(regular(12.0)).margin(vec2(4.0, 3.0));
         let resp = ui.add(te);
         keytip_badge(ui, resp.rect, "combo", id);
-        if resp.has_focus() {
-            ui.data_mut(|d| d.insert_temp(edit_id, text.clone()));
-        } else {
-            ui.data_mut(|d| d.remove::<String>(edit_id));
+        focused = resp.has_focus();
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut reveal = step != 0;
+        if search && resp.changed() {
+            s.open = true;
+            s.highlight = 0;
+            reveal = true;
         }
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        let mut regain_focus = false;
+        if s.open {
+            if s.query != text || s.items_len != items.len() {
+                s.matches = std::sync::Arc::new(font_matches(&text, items));
+                s.query = text.clone();
+                s.items_len = items.len();
+            }
+            let last = s.matches.len().saturating_sub(1);
+            s.highlight = match step {
+                1.. => s.highlight.saturating_add(1),
+                0 => s.highlight,
+                _ => s.highlight.saturating_sub(1),
+            }
+            .min(last);
+            if enter {
+                let picked = s.matches.get(s.highlight).and_then(|&i| items.get(i));
+                out = Some(match picked {
+                    Some(name) if !text.trim().is_empty() => name.clone(),
+                    _ => text.clone(),
+                });
+                s.open = false;
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Tab)) {
+                s.open = false;
+            } else if !focused {
+                // A click in the list takes focus from the field: keep the list, give focus back.
+                let over = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| s.popup.is_some_and(|r| r.contains(p)));
+                if over {
+                    regain_focus = true;
+                } else {
+                    s.open = false;
+                }
+            }
+        } else if enter {
             out = Some(text.clone());
         }
         let (ar, aresp) = ui.allocate_exact_size(vec2(16.0, resp.rect.height()), Sense::click());
         ui.painter().rect(ar, 0.0, if aresp.hovered() { t.hover } else { t.input }, Stroke::new(1.0, t.input_border), egui::StrokeKind::Inside);
-        icons::paint(ui.painter(), Rect::from_center_size(ar.center(), vec2(9.0, 9.0)), "dropdown", t.icon, t.accent);
-        egui::Popup::menu(&aresp).show(|ui| {
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                ui.set_min_width(width + 60.0);
-                for it in items {
-                    let clicked = match preview {
-                        Some(p) => p(ui, it).clicked(),
-                        None => ui.selectable_label(it == current, it).clicked(),
-                    };
-                    if clicked {
-                        out = Some(it.clone());
-                        ui.close();
-                    }
+        icons::paint(ui.painter(), Rect::from_center_size(ar.center(), vec2(DROPDOWN, DROPDOWN)), "dropdown", t.icon, t.accent);
+        // The list drops from the box's left edge, as in Word, not from the arrow (#535).
+        egui::Popup::menu(&aresp).anchor(resp.rect.union(ar)).show(|ui| {
+            if let Some(v) = combo_list(ui, width, current, items, preview) {
+                out = Some(v);
+                ui.close();
+            }
+            if search {
+                ui.separator();
+                if ui.button(tl!("Add Font…")).clicked() {
+                    out = Some(ADD_FONT.to_string());
+                    ui.close();
                 }
-            });
+            }
         });
+        if s.open && !s.matches.is_empty() {
+            let matches = s.matches.clone();
+            let scroll = reveal.then_some((s.offset, s.view_h));
+            let shown = egui::Area::new(search_id.with("list")).order(egui::Order::Tooltip).fixed_pos(resp.rect.left_bottom()).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        let item = |k: usize| matches.get(k).and_then(|&i| items.get(i));
+                        list_rows(ui, width, current, matches.len(), &item, Some(s.highlight), scroll, preview)
+                    })
+                    .inner
+            });
+            s.popup = Some(shown.response.rect);
+            let (picked, offset, view_h) = shown.inner;
+            (s.offset, s.view_h) = (offset, view_h);
+            if let Some(v) = picked {
+                out = Some(v);
+                s.open = false;
+                regain_focus = false;
+                ui.memory_mut(|m| m.surrender_focus(te_id));
+            }
+        } else {
+            s.popup = None;
+        }
+        if regain_focus && s.open {
+            ui.memory_mut(|m| m.request_focus(te_id));
+        }
+    });
+    let keep = (focused || s.open) && out.is_none();
+    ui.data_mut(|d| {
+        if keep {
+            d.insert_temp(edit_id, text);
+        } else {
+            d.remove::<String>(edit_id);
+        }
+        if search {
+            d.insert_temp(search_id, s);
+        }
     });
     out
+}
+
+/// Height of a row drawn by a combo's preview closure (`Previews::font_preview_fn`'s entries).
+pub const COMBO_PREVIEW_ROW_H: f32 = 24.0;
+
+/// A combo's scrolling list. Only the rows in view are built: the font menu lists every installed
+/// family and each preview loads that font, so building all rows loaded every font on the system
+/// (gigabytes on large font collections) and froze the app (#121).
+pub fn combo_list(ui: &mut Ui, width: f32, current: &str, items: &[String], preview: Option<&dyn Fn(&mut Ui, &str) -> Response>) -> Option<String> {
+    list_rows(ui, width, current, items.len(), &|k| items.get(k), None, None, preview).0
+}
+
+/// The rows of [`combo_list`], virtualised, for `n` items fetched by index. With a `highlight`
+/// that row is marked instead of `current`; `scroll` (last frame's offset and visible height)
+/// scrolls the highlight into view. Returns the clicked item, the scroll offset and the height.
+fn list_rows<'a>(
+    ui: &mut Ui,
+    width: f32,
+    current: &str,
+    n: usize,
+    item: &dyn Fn(usize) -> Option<&'a String>,
+    highlight: Option<usize>,
+    scroll: Option<(f32, f32)>,
+    preview: Option<&dyn Fn(&mut Ui, &str) -> Response>,
+) -> (Option<String>, f32, f32) {
+    let mut out = None;
+    let row_h = if preview.is_some() { COMBO_PREVIEW_ROW_H } else { ui.spacing().interact_size.y };
+    let mut area = egui::ScrollArea::vertical().max_height(420.0);
+    if let (Some(h), Some((offset, view_h))) = (highlight, scroll) {
+        let top = h as f32 * (row_h + ui.spacing().item_spacing.y);
+        let bottom = top + row_h;
+        let offset = if top < offset || view_h <= 0.0 {
+            top
+        } else if bottom > offset + view_h {
+            bottom - view_h
+        } else {
+            offset
+        };
+        area = area.vertical_scroll_offset(offset.max(0.0));
+    }
+    let fill = Tokens::get(ui.ctx()).checked;
+    let shown = area.show_rows(ui, row_h, n, |ui, range| {
+        ui.set_min_width(width + 60.0);
+        for k in range {
+            let Some(it) = item(k) else { continue };
+            let lit = highlight == Some(k);
+            let clicked = match preview {
+                Some(p) => {
+                    if lit {
+                        let r = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), row_h));
+                        ui.painter().rect_filled(r, 3.0, fill);
+                    }
+                    p(ui, it).clicked()
+                }
+                None => ui.selectable_label(if highlight.is_some() { lit } else { it == current }, it.as_str()).clicked(),
+            };
+            if clicked {
+                out = Some(it.clone());
+            }
+        }
+    });
+    (out, shown.state.offset.y, shown.inner_rect.height())
+}
+
+/// How a drawn button looks this frame. Hover fades in over egui's animation time and the
+/// pressed state blends in while the pointer is down, as on egui's own buttons. Framed buttons
+/// take egui's widget visuals (fill, stroke, text colour, expansion) so they match `ui.button`;
+/// frameless ones take the ribbon's hover/pressed tokens, like [`small`] and [`big`]. With
+/// animation effects off (egui's animation time is zero) both states show at once.
+pub struct DrawnState {
+    pub fill: Color32,
+    pub stroke: Stroke,
+    pub text: Color32,
+    pub expansion: f32,
+}
+
+pub fn drawn_state(ui: &Ui, resp: &Response, framed: bool) -> DrawnState {
+    let pressed = resp.is_pointer_button_down_on();
+    let h = ui.ctx().animate_bool_responsive(resp.id.with("hover"), resp.hovered() || pressed);
+    let p = ui.ctx().animate_bool_with_time(resp.id.with("press"), pressed, ui.style().animation_time.min(0.06));
+    if framed {
+        let w = &ui.visuals().widgets;
+        let mix = |a: Color32, b: Color32, c: Color32| a.lerp_to_gamma(b, h).lerp_to_gamma(c, p);
+        let num = |a: f32, b: f32, c: f32| egui::lerp(egui::lerp(a..=b, h)..=c, p);
+        DrawnState {
+            fill: mix(w.inactive.weak_bg_fill, w.hovered.weak_bg_fill, w.active.weak_bg_fill),
+            stroke: Stroke::new(
+                num(w.inactive.bg_stroke.width, w.hovered.bg_stroke.width, w.active.bg_stroke.width),
+                mix(w.inactive.bg_stroke.color, w.hovered.bg_stroke.color, w.active.bg_stroke.color),
+            ),
+            text: mix(w.inactive.fg_stroke.color, w.hovered.fg_stroke.color, w.active.fg_stroke.color),
+            expansion: num(w.inactive.expansion, w.hovered.expansion, w.active.expansion),
+        }
+    } else {
+        let t = Tokens::get(ui.ctx());
+        DrawnState {
+            fill: Color32::TRANSPARENT.lerp_to_gamma(t.hover, h).lerp_to_gamma(t.pressed, p),
+            stroke: Stroke::NONE,
+            text: t.text,
+            expansion: 0.0,
+        }
+    }
+}
+
+/// A dialog's primary button (OK, Save, Close): the accent fill with `on_accent` text, per theme.
+pub fn primary_button(ui: &Ui, text: impl Into<String>) -> egui::Button<'static> {
+    let t = Tokens::get(ui.ctx());
+    egui::Button::new(egui::RichText::new(text.into()).color(t.on_accent)).fill(t.accent)
+}
+
+/// A frameless 22 px icon button (pane close buttons): ribbon-style hover and press feedback.
+pub fn icon_button(ui: &mut Ui, icon: &str, tip: &str) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+    let st = drawn_state(ui, &resp, false);
+    ui.painter().rect_filled(r, CornerRadius::same(4), st.fill);
+    icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(14.0, 14.0)), icon, t.icon, t.accent);
+    resp.on_hover_text(tip)
+}
+
+/// A text button with a drawn icon in front. Symbols such as ✎ or 💬 aren't in the interface
+/// fonts and would draw as empty boxes, so icons are painted (`icons.rs`) rather than typed.
+/// It looks and reacts like `ui.button` (see [`drawn_state`]).
+pub fn icon_text_button(ui: &mut Ui, icon: &str, text: &str, font: egui::FontId) -> Response {
+    icon_text_button_with(ui, icon, text, font, false)
+}
+
+/// [`icon_text_button`] that opens a menu: the drop-down marker follows the text.
+pub fn icon_text_menu_button(ui: &mut Ui, icon: &str, text: &str, font: egui::FontId) -> Response {
+    icon_text_button_with(ui, icon, text, font, true)
+}
+
+fn icon_text_button_with(ui: &mut Ui, icon: &str, text: &str, font: egui::FontId, marker: bool) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
+    let pad = ui.spacing().button_padding;
+    let icon_w = 16.0;
+    let marker_w = if marker { DROPDOWN + 4.0 } else { 0.0 };
+    let size = vec2(pad.x + icon_w + 4.0 + galley.size().x + marker_w + pad.x, galley.size().y.max(icon_w) + 2.0 * pad.y);
+    let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+    let st = drawn_state(ui, &resp, true);
+    let r = r.expand(st.expansion);
+    ui.painter().rect(r, ui.visuals().widgets.inactive.corner_radius, st.fill, st.stroke, egui::StrokeKind::Inside);
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(pos2(r.min.x + pad.x + icon_w / 2.0, r.center().y), vec2(icon_w, icon_w)),
+        icon,
+        t.icon,
+        t.accent,
+    );
+    let text_x = r.min.x + pad.x + icon_w + 4.0;
+    let text_w = galley.size().x;
+    ui.painter().galley(pos2(text_x, r.center().y - galley.size().y / 2.0), galley, st.text);
+    if marker {
+        let c = pos2(text_x + text_w + 4.0 + DROPDOWN / 2.0, r.center().y);
+        icons::paint(ui.painter(), Rect::from_center_size(c, vec2(DROPDOWN, DROPDOWN)), "dropdown", st.text, st.text);
+    }
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #653: a large button's label line is no taller than `LABEL_LINE_H` in the interface font, so
+    /// two lines (checked at compile time) end above the group title row.
+    #[test]
+    fn big_button_label_lines_fit_their_slot() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::theme::font_definitions(false, false));
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        let h = ctx.fonts_mut(|f| f.layout_no_wrap("Page Number Mail Merge gjpqy".into(), crate::theme::regular(11.5), Color32::WHITE).size().y);
+        assert!(h <= LABEL_LINE_H, "label line is {h} px tall");
+    }
+
+    #[test]
+    fn drawn_buttons_fade_in_on_hover_and_darken_while_pressed() {
+        // #305's drawn replacements for ✕, 💬, ✎ and ➕ must react like egui's buttons.
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, crate::theme::Appearance::Light);
+        let clock = std::cell::Cell::new(0u32);
+        let seen = std::cell::Cell::new((Rect::NOTHING, Rect::NOTHING, Color32::PLACEHOLDER, Color32::PLACEHOLDER));
+        // One 60 fps frame; returns both buttons' rects and fills (framed, frameless).
+        let frame = |events: Vec<egui::Event>| {
+            clock.set(clock.get() + 1);
+            let input = egui::RawInput { time: Some(f64::from(clock.get()) / 60.0), predicted_dt: 1.0 / 60.0, events, ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                let framed = icon_text_button(ui, "comment", "Comments", regular(12.0));
+                let frameless = icon_button(ui, "close", "Close");
+                let (a, b) = (drawn_state(ui, &framed, true).fill, drawn_state(ui, &frameless, false).fill);
+                seen.set((framed.rect, frameless.rect, a, b));
+            })
+            .drop_without_applying_deltas();
+            seen.get()
+        };
+        // Half a second of frames, so animations finish; returns the last one.
+        let settle = || {
+            for _ in 0..29 {
+                frame(vec![]);
+            }
+            frame(vec![])
+        };
+        let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let w = ctx.global_style().visuals.widgets.clone();
+        let t = Tokens::light();
+
+        let (framed, frameless, idle, idle_bare) = settle();
+        assert_eq!(idle, w.inactive.weak_bg_fill);
+        assert_eq!(idle_bare, Color32::TRANSPARENT);
+
+        // Hover fades in over a few frames rather than jumping, then settles on egui's hovered fill.
+        let first = frame(vec![egui::Event::PointerMoved(framed.center())]).2;
+        let between = |c: Color32, a: Color32, b: Color32| a.r().min(b.r()) < c.r() && c.r() < a.r().max(b.r());
+        assert!(between(first, idle, w.hovered.weak_bg_fill), "hover should animate: {idle:?} → {first:?} → {:?}", w.hovered.weak_bg_fill);
+        assert_eq!(settle().2, w.hovered.weak_bg_fill);
+        // Held down: blends to the pressed (active) fill.
+        frame(vec![press(framed.center(), true)]);
+        assert_eq!(settle().2, w.active.weak_bg_fill);
+        frame(vec![press(framed.center(), false)]);
+
+        // The frameless close button uses the ribbon's hover and pressed tokens; the other fades out.
+        frame(vec![egui::Event::PointerMoved(frameless.center())]);
+        let after = settle();
+        assert_eq!(after.3, t.hover);
+        assert_eq!(after.2, w.inactive.weak_bg_fill);
+        frame(vec![press(frameless.center(), true)]);
+        assert_eq!(settle().3, t.pressed);
+    }
+
+    #[test]
+    fn font_matches_puts_exact_and_prefix_before_substring() {
+        let items: Vec<String> = ["Arial Black", "Arial", "Courier New", "Times New Roman", "Roman Serif"].map(String::from).to_vec();
+        // Case-insensitive; the exact name first, then prefixes, then other substrings.
+        assert_eq!(font_matches("ARIAL", &items), vec![1, 0]);
+        assert_eq!(font_matches("roman", &items), vec![4, 3]);
+        assert_eq!(font_matches(" new ", &items), vec![2, 3]);
+        assert!(font_matches("zapfino", &items).is_empty());
+        assert_eq!(font_matches("", &items), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// Focuses a fresh combo, types `typed`, presses `keys` (one per frame) and returns its value.
+    fn type_into_combo(search: bool, items: &[String], typed: &str, keys: &[egui::Key]) -> Option<String> {
+        let ctx = egui::Context::default();
+        let key = |k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let mut frames = vec![vec![], vec![egui::Event::Text(typed.into())]];
+        frames.extend(keys.iter().map(|&k| vec![key(k)]));
+        let mut out = None;
+        for (n, events) in frames.into_iter().enumerate() {
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                if n == 0 {
+                    ui.memory_mut(|m| m.request_focus(ui.id().with(("combo_edit", "f"))));
+                }
+                let v = if search { font_combo(ui, "f", 150.0, "", items, None) } else { combo(ui, "f", 150.0, "", items, None) };
+                out = out.take().or(v);
+            })
+            .drop_without_applying_deltas();
+        }
+        out
+    }
+
+    #[test]
+    fn typing_in_the_font_box_finds_the_family() {
+        // #359: typing "arial" or "roman" picks the installed family; the size box stays literal.
+        use egui::Key::{ArrowDown, Enter, Escape};
+        let fonts: Vec<String> = ["Arial", "Arial Black", "Courier New", "Times New Roman"].map(String::from).to_vec();
+        assert_eq!(type_into_combo(true, &fonts, "arial", &[Enter]).as_deref(), Some("Arial"));
+        assert_eq!(type_into_combo(true, &fonts, "roman", &[Enter]).as_deref(), Some("Times New Roman"));
+        assert_eq!(type_into_combo(true, &fonts, "arial", &[ArrowDown, Enter]).as_deref(), Some("Arial Black"));
+        // Not installed: applied as typed, as Word allows.
+        assert_eq!(type_into_combo(true, &fonts, "Zapfino", &[Enter]).as_deref(), Some("Zapfino"));
+        assert_eq!(type_into_combo(true, &fonts, "arial", &[Escape]), None);
+        let sizes: Vec<String> = ["10", "11", "12"].map(String::from).to_vec();
+        assert_eq!(type_into_combo(false, &sizes, "1", &[Enter]).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_long_combo_list_builds_only_the_rows_in_view() {
+        // #121: the font menu built (and so loaded the font of) every installed family.
+        let items: Vec<String> = (0..5000).map(|i| format!("Family {i}")).collect();
+        let ctx = egui::Context::default();
+        let built = std::cell::RefCell::new(Vec::new());
+        let row = |ui: &mut Ui, name: &str| {
+            built.borrow_mut().push(name.to_string());
+            ui.allocate_exact_size(vec2(260.0, COMBO_PREVIEW_ROW_H), Sense::click()).1
+        };
+        for _ in 0..3 {
+            built.borrow_mut().clear();
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert_eq!(combo_list(ui, 150.0, "", &items, Some(&row)), None);
+            })
+            .drop_without_applying_deltas();
+            let b = built.borrow();
+            assert!(!b.is_empty() && b.len() <= 420 / COMBO_PREVIEW_ROW_H as usize + 2, "built {} rows", b.len());
+            assert_eq!(b[0], "Family 0");
+        }
+        // Without previews too.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert_eq!(combo_list(ui, 52.0, "8", &items, None), None);
+        })
+        .drop_without_applying_deltas();
+    }
 }

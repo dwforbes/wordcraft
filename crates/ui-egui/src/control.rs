@@ -2,13 +2,14 @@
 //!
 //! Methods (JSON lines over the host's transport, see `docs/control-protocol.md`):
 //! - `engine.execute {command, params}`: run any command (engine or `ui.*`)
-//! - `engine.commands`: every command with its enablement
+//! - `engine.commands {search?}`: engine and app print commands with enablement and parameters
 //! - `document.inspect`: document structure; `ui.inspect`: UI state, canvas geometry, perf
 //! - `ui.click {x, y, button?, count?, shift?, cmd?}`, `ui.move {x, y}`, `ui.drag {x, y, toX, toY}`:
 //!   real pointer input in screen points (reaches every widget)
 //! - `ui.clickText {page, x, y}`: click at a page position (points from the page's top-left)
 //! - `ui.key {key, shift?, alt?, cmd?}`, `ui.text {text}`: keyboard input through egui
-//! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path, page?, scale?}`: page PNG
+//! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path?, page?, scale?}`: page PNG
+//!   (without `path`, both reply with the PNG as base64 `png`)
 //! - `ui.parity`: feature catalog parity
 
 use std::sync::mpsc::Sender;
@@ -54,6 +55,8 @@ pub fn inspect(app: &mut WordApp, ctx: &egui::Context) -> Value {
         "pages": app.canvas.page_rects.iter().map(|r| [r.left(), r.top(), r.width(), r.height()]).collect::<Vec<_>>(),
         "scale": app.canvas.scale,
         "caret": caret,
+        "balloons": app.canvas.balloon_rects.iter().map(|(id, r)| json!({"id": id, "rect": [r.left(), r.top(), r.width(), r.height()]})).collect::<Vec<_>>(),
+        "balloon": app.canvas.balloon,
         "focused": app.canvas.focused,
         "title": app.title_stem(),
         "dirty": app.session.dirty,
@@ -116,12 +119,19 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
         }
         "engine.commands" => {
             let reg = app.session.registry.clone();
-            ok(Value::Array(
-                reg.all()
-                    .iter()
-                    .map(|c| json!({"id": c.id, "label": c.label, "location": c.location, "shortcut": c.shortcut, "params": c.params, "enabled": (c.enabled)(&app.session).is_none()}))
-                    .collect(),
-            ))
+            let mut commands: Vec<Value> = reg.all().iter()
+                .map(|c| json!({"id": c.id, "label": c.label, "location": c.location, "shortcut": c.shortcut, "params": c.params, "enabled": (c.enabled)(&app.session).is_none()}))
+                .collect();
+            commands.extend(crate::printing::commands(app));
+            let search = s("search").unwrap_or("").to_ascii_lowercase();
+            if !search.is_empty() {
+                commands.retain(|command| {
+                    ["id", "label", "location", "params"]
+                        .iter()
+                        .any(|field| command.get(field).and_then(Value::as_str).is_some_and(|text| text.to_ascii_lowercase().contains(&search)))
+                });
+            }
+            ok(Value::Array(commands))
         }
         "document.inspect" => match app.session.run("document.inspect", p) {
             Ok(v) => ok(v),
@@ -201,11 +211,19 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
         }
         "ui.screenshot" => Outcome::Screenshot { path: s("path").map(str::to_string) },
         "ui.render" => {
-            let path = s("path").unwrap_or("/tmp/wordcraft-page.png");
             let page = p.get("page").and_then(Value::as_u64).unwrap_or(1);
-            match app.session.run("file.exportPng", &json!({"path": path, "page": page, "scale": f("scale").unwrap_or(2.0)})) {
-                Ok(v) => ok(v),
-                Err(e) => err(e),
+            let scale = f("scale").unwrap_or(2.0);
+            match s("path") {
+                Some(path) => match app.session.run("file.exportPng", &json!({"path": path, "page": page, "scale": scale})) {
+                    Ok(v) => ok(v),
+                    Err(e) => err(e),
+                },
+                // No path: the PNG travels in the reply. Never a fixed name in the shared
+                // temporary folder, where another user could have planted a link to a file.
+                None => match render_png(app, page, scale) {
+                    Ok(v) => ok(v),
+                    Err(e) => err(e),
+                },
             }
         }
         "ui.resize" => {
@@ -232,12 +250,27 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
     }
 }
 
+/// A page rendered by the engine, as base64 PNG in the reply (the same shape as the headless
+/// MCP server's `ui.render`).
+fn render_png(app: &WordApp, page: u64, scale: f32) -> Result<Value, String> {
+    let page = usize::try_from(page.max(1)).unwrap_or(usize::MAX).saturating_sub(1);
+    let l = app.session.export_layout();
+    let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page + 1))?;
+    let img = wordcraft_render::render_page(&app.session.doc, pg, scale.clamp(0.1, 8.0), &Default::default());
+    let png = img.to_png();
+    Ok(json!({"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": img.width, "height": img.height, "pages": l.pages.len()}))
+}
+
+/// The window screenshot: written to `path` when one was given, else base64 PNG in the reply
+/// (never a fixed name in the shared temporary folder).
 pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
-    let path = path.unwrap_or("/tmp/wordcraft-screenshot.png");
     let [w, h] = image.size;
     let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     let rendered = wordcraft_render::Rendered { width: w as u32, height: h as u32, pixels: bytes };
     let png = rendered.to_png();
+    let Some(path) = path else {
+        return json!({"ok": true, "result": {"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": w, "height": h}});
+    };
     #[cfg(target_arch = "wasm32")]
     let _ = (&png, path);
     #[cfg(not(target_arch = "wasm32"))]

@@ -142,7 +142,7 @@ pub fn check(text: &str) -> Vec<Issue> {
                     Suggestion::Remove => String::new(),
                 })
                 .collect();
-            Some(Issue { start, end, kind: IssueKind::Grammar, message: l.message, suggestions })
+            Some(Issue { start, end, kind: IssueKind::Grammar, message: l.message, suggestions, lang: crate::ProofLang::En })
         })
         .collect();
     if st.cache_bytes.saturating_add(text.len()) > CACHE_BYTES {

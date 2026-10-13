@@ -8,6 +8,10 @@ use crate::props::{
 };
 use crate::styles::{StyleKind, StyleSheet};
 
+/// Automatic (HTML-style) paragraph spacing, points: what Word for Windows gives `w:beforeAutospacing`
+/// and `w:afterAutospacing` at any font size (measured).
+pub const AUTO_SPACING: f32 = 14.0;
+
 /// Concrete character formatting.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,13 +36,21 @@ pub struct ResolvedChar {
     pub spacing: f32,
     pub scale: f32,
     pub position: f32,
+    /// Kerning: the smallest font size, in points, that is kerned (`w:kern`); 0 = never kerned.
+    #[serde(default)]
+    pub kern: f32,
     pub outline: bool,
     pub shadow: bool,
     pub emboss: bool,
     pub engrave: bool,
+    /// WordArt text effects (sanitized; `None` when there are none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_effects: Option<Box<crate::wordart::TextEffects>>,
     pub link: Option<String>,
     pub ins: Option<u32>,
     pub del: Option<u32>,
+    /// The revision of a tracked formatting change (`w:rPrChange`) of the run.
+    pub fmt: Option<u32>,
     pub no_proof: bool,
     pub lang: Option<String>,
     /// Right-to-left run (`w:rtl`).
@@ -47,6 +59,9 @@ pub struct ResolvedChar {
     pub cs: bool,
     /// Complex-script font, size, bold and italic (Arabic, Persian, Hebrew… text).
     pub font_cs: String,
+    /// East Asian font (Chinese, Japanese and Korean text), when one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_ea: Option<String>,
     pub size_cs: f32,
     pub bold_cs: bool,
     pub italic_cs: bool,
@@ -74,18 +89,22 @@ impl ResolvedChar {
             spacing: c.spacing.unwrap_or(0.0).clamp(-100.0, 100.0),
             scale: c.scale.unwrap_or(100.0).clamp(1.0, 600.0),
             position: c.position.unwrap_or(0.0).clamp(-800.0, 800.0),
+            kern: c.kern.filter(|k| k.is_finite()).unwrap_or(0.0).clamp(0.0, 1638.0),
             outline: c.outline.unwrap_or(false),
             shadow: c.shadow.unwrap_or(false),
             emboss: c.emboss.unwrap_or(false),
             engrave: c.engrave.unwrap_or(false),
+            text_effects: c.text_effects.as_deref().map(crate::wordart::TextEffects::sanitized).filter(|t| !t.is_empty()).map(Box::new),
             link: c.link.clone(),
             ins: c.ins,
             del: c.del,
+            fmt: c.fmt_change.as_ref().map(|f| f.rev),
             no_proof: c.no_proof.unwrap_or(false),
             lang: c.lang.clone(),
             rtl: c.rtl.unwrap_or(false),
             cs: c.cs.unwrap_or(false),
             font_cs: c.font_cs.clone().or_else(|| c.font.clone()).unwrap_or_else(|| crate::styles::BODY_FONT.to_string()),
+            font_ea: c.font_ea.clone(),
             size_cs: c.size_cs.or(c.size).unwrap_or(11.0).clamp(1.0, 1638.0),
             bold_cs: c.bold_cs.or(c.bold).unwrap_or(false),
             italic_cs: c.italic_cs.or(c.italic).unwrap_or(false),
@@ -96,6 +115,11 @@ impl ResolvedChar {
     /// characters, and every character of an `rtl`/`cs` run, this way).
     pub fn complex(&self) -> ResolvedChar {
         ResolvedChar { font: self.font_cs.clone(), size: self.size_cs, bold: self.bold_cs, italic: self.italic_cs, ..self.clone() }
+    }
+    /// Whether the text is kerned: Word kerns only a run with Kerning for fonts set (`w:kern`) at
+    /// a size of at least that many points, never by default (measured in Word for Windows).
+    pub fn kerned(&self) -> bool {
+        self.kern > 0.0 && self.size >= self.kern
     }
     /// Does a character of this run use the complex-script properties?
     pub fn uses_complex(&self, c: char) -> bool {
@@ -127,8 +151,16 @@ pub struct ResolvedPara {
     pub indent_first: f32,
     pub space_before: f32,
     pub space_after: f32,
+    /// The space before or after is automatic (HTML-style, [`AUTO_SPACING`]): see
+    /// `ParaProps::space_before_auto`.
+    #[serde(default)]
+    pub before_auto: bool,
+    #[serde(default)]
+    pub after_auto: bool,
     pub line_spacing: LineSpacing,
     pub contextual_spacing: bool,
+    /// Left/right indents are inside/outside: they swap on even pages.
+    pub mirror_indents: bool,
     pub keep_next: bool,
     pub keep_lines: bool,
     pub page_break_before: bool,
@@ -140,7 +172,25 @@ pub struct ResolvedPara {
     pub borders: Option<Borders>,
     pub bidi: bool,
     pub drop_cap: u8,
+    /// A text frame the paragraph sits in (see `ParaProps::frame`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<crate::props::TextFrame>,
     pub suppress_hyphens: bool,
+    pub suppress_line_numbers: bool,
+    /// Asian typography (see `ParaProps`): East Asian line-breaking rules.
+    pub kinsoku: bool,
+    /// Latin words wrap whole (`false`: they may break at any character).
+    pub word_wrap: bool,
+    pub overflow_punct: bool,
+    pub top_line_punct: bool,
+    pub auto_space_de: bool,
+    pub auto_space_dn: bool,
+    /// Lines snap to the document grid, when the section has one.
+    pub snap_to_grid: bool,
+    /// Indents in characters (left, right, first line; 0 = in points), which win over the
+    /// point values; see [`ResolvedPara::set_char_unit`].
+    #[serde(default)]
+    pub indent_chars: [f32; 3],
 }
 
 const MAX_INDENT: f32 = 1584.0; // 22"
@@ -151,6 +201,18 @@ impl ResolvedPara {
     /// `w:ind/@w:start`, read from `w:left` too).
     pub fn visual_indents(&self) -> (f32, f32) {
         if self.bidi { (self.indent_right, self.indent_left) } else { (self.indent_left, self.indent_right) }
+    }
+
+    /// Turn the indents given in characters into points, one character being `size` points: the
+    /// size of the paragraph mark's font (as Word measures `w:firstLineChars` and friends).
+    pub fn set_char_unit(&mut self, size: f32) {
+        let size = if size.is_finite() { size.clamp(1.0, 1638.0) } else { 12.0 };
+        let [l, r, f] = self.indent_chars;
+        for (chars, pts) in [(l, &mut self.indent_left), (r, &mut self.indent_right), (f, &mut self.indent_first)] {
+            if chars != 0.0 {
+                *pts = (chars * size).clamp(-MAX_INDENT, MAX_INDENT);
+            }
+        }
     }
 }
 
@@ -166,14 +228,17 @@ impl ResolvedPara {
             indent_left: clampi(p.indent_left),
             indent_right: clampi(p.indent_right),
             indent_first: clampi(p.indent_first),
-            space_before: p.space_before.unwrap_or(0.0).clamp(0.0, 1584.0),
-            space_after: p.space_after.unwrap_or(0.0).clamp(0.0, 1584.0),
+            space_before: if p.space_before_auto == Some(true) { AUTO_SPACING } else { p.space_before.unwrap_or(0.0).clamp(0.0, 1584.0) },
+            space_after: if p.space_after_auto == Some(true) { AUTO_SPACING } else { p.space_after.unwrap_or(0.0).clamp(0.0, 1584.0) },
+            before_auto: p.space_before_auto == Some(true),
+            after_auto: p.space_after_auto == Some(true),
             line_spacing: match p.line_spacing.unwrap_or_default() {
                 LineSpacing::Multiple(m) => LineSpacing::Multiple(if m.is_finite() { m.clamp(0.06, 132.0) } else { 1.0 }),
                 LineSpacing::AtLeast(v) => LineSpacing::AtLeast(if v.is_finite() { v.clamp(0.0, 1584.0) } else { 0.0 }),
                 LineSpacing::Exactly(v) => LineSpacing::Exactly(if v.is_finite() { v.clamp(0.7, 1584.0) } else { 12.0 }),
             },
             contextual_spacing: p.contextual_spacing.unwrap_or(false),
+            mirror_indents: p.mirror_indents.unwrap_or(false),
             keep_next: p.keep_next.unwrap_or(false),
             keep_lines: p.keep_lines.unwrap_or(false),
             page_break_before: p.page_break_before.unwrap_or(false),
@@ -185,10 +250,24 @@ impl ResolvedPara {
             borders: p.borders.filter(Borders::any_visible),
             bidi: p.bidi.unwrap_or(false),
             drop_cap: p.drop_cap.unwrap_or(0).min(10),
+            frame: p.frame.clone().filter(|_| p.drop_cap.unwrap_or(0) == 0),
             suppress_hyphens: p.suppress_hyphens.unwrap_or(false),
+            suppress_line_numbers: p.suppress_line_numbers.unwrap_or(false),
+            kinsoku: p.kinsoku.unwrap_or(true),
+            word_wrap: p.word_wrap.unwrap_or(true),
+            overflow_punct: p.overflow_punct.unwrap_or(true),
+            top_line_punct: p.top_line_punct.unwrap_or(false),
+            auto_space_de: p.auto_space_de.unwrap_or(true),
+            auto_space_dn: p.auto_space_dn.unwrap_or(true),
+            snap_to_grid: p.snap_to_grid.unwrap_or(true),
+            indent_chars: [p.indent_left_chars, p.indent_right_chars, p.indent_first_chars]
+                .map(|c| c.filter(|c| c.is_finite()).unwrap_or(0.0).clamp(-MAX_CHARS, MAX_CHARS)),
         }
     }
 }
+
+/// The largest indent in characters (Word allows indents up to 22").
+const MAX_CHARS: f32 = 1584.0;
 
 impl StyleSheet {
     /// Paragraph properties after defaults and the style chain (without direct formatting).
@@ -239,7 +318,13 @@ impl StyleSheet {
             direct.tabs = Some(merged);
         }
         base.overlay(&direct);
-        ResolvedPara::from(&base, &style)
+        let mut rp = ResolvedPara::from(&base, &style);
+        // Indents in characters: measured in the style's font size here; layout measures them in
+        // the paragraph mark's (`set_char_unit`), which direct formatting may change.
+        if rp.indent_chars.iter().any(|c| *c != 0.0) {
+            rp.set_char_unit(self.resolve_char(Some(&style), &CharProps::default()).size);
+        }
+        rp
     }
 
     /// Resolve character formatting for a run in a paragraph of style `para_style`.

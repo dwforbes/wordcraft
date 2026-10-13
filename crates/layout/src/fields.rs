@@ -16,17 +16,32 @@ pub struct FieldCtx {
     /// Pages in the current section.
     pub section_pages: u32,
     pub section: u32,
-    /// Note part id → number, in document order.
-    pub notes: Arc<HashMap<u32, u32>>,
+    /// Note part id → its number.
+    pub notes: Arc<HashMap<u32, NoteNum>>,
     /// Document title / author for TITLE / AUTHOR fields.
     pub title: Arc<str>,
     pub author: Arc<str>,
     pub filename: Arc<str>,
 }
 
+/// A footnote's or endnote's number, as its section's options give it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NoteNum {
+    pub n: u32,
+    pub fmt: NumFormat,
+    /// Index of the section (`Document::sections`) its reference is in.
+    pub section: usize,
+    /// Place among the notes of its kind, in document order.
+    pub order: u32,
+}
+
 impl FieldCtx {
-    pub fn note_number(&self, id: u32) -> u32 {
-        self.notes.get(&id).copied().unwrap_or(1)
+    /// The mark of note `id` (its number in its format); `fmt` for a note not counted.
+    pub fn note_mark(&self, id: u32, fmt: NumFormat) -> String {
+        match self.notes.get(&id) {
+            Some(n) => n.fmt.format(n.n),
+            None => fmt.format(1),
+        }
     }
     /// A key for caches: the parts of the context a page-dependent paragraph depends on.
     pub fn page_key(&self) -> (u32, u32, u32, u32) {
@@ -40,7 +55,7 @@ pub fn field_name(instr: &str) -> String {
 }
 
 /// `\* FORMAT` switch value (Arabic, roman, ROMAN, alphabetic, ALPHABETIC, CardText, Ordinal…).
-fn format_switch(instr: &str) -> Option<NumFormat> {
+pub fn format_switch(instr: &str) -> Option<NumFormat> {
     let mut it = instr.split_whitespace();
     while let Some(w) = it.next() {
         if w == "\\*" {
@@ -54,11 +69,23 @@ fn format_switch(instr: &str) -> Option<NumFormat> {
                 "OrdText" | "ordtext" => NumFormat::OrdinalText,
                 "Ordinal" | "ordinal" => NumFormat::Ordinal,
                 "Arabic" | "arabic" => NumFormat::Decimal,
+                // Chinese numerals: counting (一百零一), legal (壹佰零壹), digit by digit (一〇一).
+                v if v.eq_ignore_ascii_case("ChineseNum1") => NumFormat::ChineseCountingThousand,
+                v if v.eq_ignore_ascii_case("ChineseNum2") => NumFormat::ChineseLegalSimplified,
+                v if v.eq_ignore_ascii_case("ChineseNum3") => NumFormat::IdeographDigital,
                 _ => continue,
             });
         }
     }
     None
+}
+
+/// The light grey behind a field shown as its code.
+pub const FIELD_SHADING: wordcraft_doc::props::Rgb = wordcraft_doc::props::Rgb(0xD9, 0xD9, 0xD9);
+
+/// What a field shows in code view: its instruction in braces, `{ PAGE }`.
+pub fn field_code_text(instr: &str) -> String {
+    format!("{{ {} }}", instr.trim())
 }
 
 /// Display text for a field and whether it depends on the page it lands on.
@@ -87,7 +114,11 @@ mod tests {
         assert_eq!(field_text("PAGE", "", &ctx), ("4".into(), true));
         assert_eq!(field_text(" PAGE \\* ROMAN ", "", &ctx).0, "IV");
         assert_eq!(field_text("NUMPAGES \\* CardText", "", &ctx).0, "Twelve");
+        assert_eq!(field_text("NUMPAGES \\* CHINESENUM1", "", &ctx).0, "十二");
+        assert_eq!(field_text("PAGE \\* ChineseNum2", "", &ctx).0, "肆");
         assert_eq!(field_text("DATE \\@ \"M/d/yyyy\"", "1/2/2026", &ctx), ("1/2/2026".into(), false));
         assert_eq!(field_name("=SUM(ABOVE)"), "SUM(ABOVE)");
+        assert_eq!(field_code_text(" PAGE \\* ROMAN "), "{ PAGE \\* ROMAN }");
+        assert_eq!(field_code_text(""), "{  }");
     }
 }

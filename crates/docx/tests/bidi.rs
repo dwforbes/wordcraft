@@ -114,8 +114,8 @@ fn reads_word_style_bidi_markup() {
     assert_eq!(fa.font.as_deref(), Some("Times New Roman"));
     assert_eq!(fa.font_cs.as_deref(), Some("B Lotus"));
     assert_eq!((fa.size, fa.size_cs), (Some(12.0), Some(16.0)));
-    // b + bCs alike is stored once: an unset complex-script bold is the same as `bold`.
-    assert_eq!((fa.bold, fa.bold_cs, fa.rtl), (Some(true), None, Some(true)));
+    // Both explicit values survive, even when they happen to be equal.
+    assert_eq!((fa.bold, fa.bold_cs, fa.rtl), (Some(true), Some(true), Some(true)));
     assert_eq!((fa.lang.as_deref(), fa.lang_bidi.as_deref()), (Some("en-US"), Some("fa-IR")));
     assert_eq!(ps[1].props.bidi, Some(false));
     let x = &ps[1].runs[0].props;
@@ -138,4 +138,40 @@ fn hostile_bidi_markup_is_bounded() {
     assert_eq!(c.font_cs, None, "absurd font names are dropped");
     assert_eq!(c.lang_bidi, None);
     assert!(c.size_cs.is_none_or(|s| (1.0..=1638.0).contains(&s)));
+}
+
+/// Right-to-left tables (`w:tblPr/w:bidiVisual`, ECMA-376 Part 1 §17.4.1) and sections
+/// (`w:sectPr/w:bidi`, §17.6.1) read, write in schema order and round-trip (#362).
+#[test]
+fn rtl_tables_and_sections_round_trip() {
+    let body = r#"
+<w:tbl>
+  <w:tblPr><w:bidiVisual/><w:tblW w:w="0" w:type="auto"/><w:tblInd w:w="360" w:type="dxa"/></w:tblPr>
+  <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+  <w:tr><w:tc><w:p><w:r><w:t>اول</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>دوم</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+<w:tbl>
+  <w:tblPr><w:bidiVisual w:val="0"/></w:tblPr>
+  <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>
+  <w:tr><w:tc><w:p/></w:tc></w:tr>
+</w:tbl>
+<w:p/>
+<w:sectPr><w:cols w:num="2" w:space="720"/><w:bidi/></w:sectPr>"#;
+    let d = wordcraft_docx::read(&docx(body)).unwrap();
+    let tables: Vec<&wordcraft_doc::Table> = d.body.iter().filter_map(|b| b.as_table()).collect();
+    assert_eq!(tables.len(), 2);
+    assert!(tables[0].props.bidi_visual, "w:bidiVisual reads as a right-to-left table");
+    assert_eq!(tables[0].props.indent, Some(18.0), "the indent is kept (measured from the right)");
+    assert!(!tables[1].props.bidi_visual, "w:val=0 turns it off");
+    assert!(d.last_section.rtl, "w:bidi in sectPr is a right-to-left section");
+    let bytes = wordcraft_docx::write(&d).unwrap();
+    let xml = document_xml(&bytes);
+    assert_eq!(xml.matches("<w:bidiVisual/>").count(), 1, "{xml}");
+    // CT_TblPr is a sequence: tblStyle, tblpPr, tblOverlap, bidiVisual, … tblW, jc, … tblInd.
+    let pos = |t: &str| xml.find(t).unwrap_or_else(|| panic!("{t} missing: {xml}"));
+    assert!(pos("<w:bidiVisual/>") < pos("<w:tblW"));
+    let r = wordcraft_docx::read(&bytes).unwrap();
+    let again: Vec<bool> = r.body.iter().filter_map(|b| b.as_table()).map(|t| t.props.bidi_visual).collect();
+    assert_eq!(again, vec![true, false]);
+    assert!(r.last_section.rtl && r.last_section.columns.count == 2);
 }

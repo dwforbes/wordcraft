@@ -7,15 +7,65 @@
 //! error or a best-effort document, never a panic.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod chart_spec;
+mod crypt;
 mod custom;
+mod flat;
 mod package;
 mod read;
+mod smart_art;
 mod units;
+mod wordml2003;
 mod write;
 mod xml;
 
+pub use chart_spec::{chart_items, chart_xml};
+pub use crypt::{
+    DEFAULT_SPIN_COUNT, MAX_PASSWORD_CHARS, PasswordCheck, check_password, check_protection_password, decrypt, encrypt, encrypt_with_spin_count,
+    is_encrypted, protection_hash,
+};
+pub use flat::{XmlKind, sniff_xml, write as write_flat};
 pub use read::read;
+pub use smart_art::smart_art_items;
 pub use write::{write, write_as};
+
+/// Largest `.xml` file read as a Word XML document.
+pub const MAX_XML_FILE: usize = 1 << 30;
+
+/// Read a Word XML file (`.xml`): a Word XML Document (Flat OPC, the whole package in one XML
+/// file) or a Word 2003 XML Document (WordprocessingML 2003), told apart by the root element.
+/// Any other XML gives [`DocxError::NotWordXml`].
+pub fn read_xml(bytes: &[u8]) -> Result<wordcraft_doc::Document, DocxError> {
+    if bytes.len() > MAX_XML_FILE {
+        return Err(DocxError::Limit(format!("XML file of {} bytes", bytes.len())));
+    }
+    match sniff_xml(bytes) {
+        XmlKind::FlatOpc => flat::read(bytes),
+        XmlKind::WordMl2003 => wordml2003::read(bytes),
+        XmlKind::Other => Err(DocxError::NotWordXml),
+    }
+}
+
+/// What [`DocxError::PasswordRequired`] says.
+pub const PASSWORD_REQUIRED: &str = "this document is protected with a password";
+/// What [`DocxError::WrongPassword`] says.
+pub const WRONG_PASSWORD: &str = "the password is incorrect";
+
+/// The `a:ext` URI under a Drawing Canvas's `wpc:extLst` that holds its turn and flips as an
+/// `a:xfrm` (`rot`, `flipH`, `flipV`). Neither the canvas schema nor `wp:anchor` carries a
+/// transform, so this rides in the extension list Word and other readers skip.
+pub(crate) const CANVAS_SPIN_EXT: &str = "urn:wordcraft:canvas-xfrm";
+
+/// Read a package that may be password-protected ([`is_encrypted`]): it is decrypted with
+/// `password` first. An encrypted package without a password gives
+/// [`DocxError::PasswordRequired`]; a wrong one, [`DocxError::WrongPassword`].
+pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<wordcraft_doc::Document, DocxError> {
+    if is_encrypted(bytes) {
+        let package = zeroize::Zeroizing::new(decrypt(bytes, password)?);
+        return read::read_package(&package);
+    }
+    read(bytes)
+}
 
 /// Which kind of WordprocessingML package to write. The main part's content type differs per
 /// kind, and Word refuses a file whose content type doesn't match its extension.
@@ -78,4 +128,17 @@ pub enum DocxError {
     /// The package is readable but isn't a WordprocessingML document.
     #[error("not a Word document: {0}")]
     NotWord(String),
+    /// An `.xml` file that is neither a Word XML Document (Flat OPC) nor Word 2003 XML.
+    #[error("not a Word XML document")]
+    NotWordXml,
+    /// The package is encrypted and no password was given.
+    #[error("{}", PASSWORD_REQUIRED)]
+    PasswordRequired,
+    /// The password doesn't open the package.
+    #[error("{}", WRONG_PASSWORD)]
+    WrongPassword,
+    /// The package is encrypted in a way WordCraft can't read, or its encryption data is damaged
+    /// (or encrypting failed).
+    #[error("encrypted document: {0}")]
+    Encryption(String),
 }

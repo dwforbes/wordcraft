@@ -37,6 +37,10 @@ pub struct Style {
     pub hidden: bool,
     /// Built in (cannot be deleted).
     pub builtin: bool,
+    /// Can't be applied while Restrict Editing limits formatting to a selection of styles
+    /// (`w:locked`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     /// Table style: conditional formatting for header row, banding etc.
     pub table: Option<TableStyleParts>,
 }
@@ -52,27 +56,52 @@ pub struct TableStyleParts {
     pub cell_margins: Option<[f32; 4]>,
     pub header_fill: Option<Rgb>,
     pub header_chr: CharProps,
+    /// Cell borders of the header row (`firstRow` region's `w:tcBorders`): `between` is the
+    /// border between header rows, `inside_v` between its cells.
+    pub header_borders: Option<Borders>,
     pub band_fill: Option<Rgb>,
+    /// Character formatting of the odd row bands (`band1Horz` region).
+    pub band_chr: CharProps,
+    /// Cell borders of the odd row bands (`band1Horz` region's `w:tcBorders`).
+    pub band_borders: Option<Borders>,
+    /// Rows per band (`w:tblStyleRowBandSize`); one when unset.
+    pub band_size: Option<u32>,
     pub first_col_chr: CharProps,
     pub total_chr: CharProps,
     pub total_border_top: Option<Border>,
+    /// Shading and cell borders of the first column (`firstCol` region).
+    pub first_col_fill: Option<Rgb>,
+    pub first_col_borders: Option<Borders>,
+    /// The last column (`lastCol` region).
+    pub last_col_fill: Option<Rgb>,
+    pub last_col_chr: CharProps,
+    pub last_col_borders: Option<Borders>,
+    /// Shading and cell borders of the total (last) row (`lastRow` region); a top edge left
+    /// unset falls back to `total_border_top`.
+    pub total_fill: Option<Rgb>,
+    pub total_borders: Option<Borders>,
+    /// The odd column bands (`band1Vert` region).
+    pub col_band_fill: Option<Rgb>,
+    pub col_band_chr: CharProps,
+    pub col_band_borders: Option<Borders>,
 }
 
 impl TableStyleParts {
     /// Apply `patch` (a style further down a based-on chain) over these parts: what it sets wins,
     /// the rest is inherited; borders merge edge by edge.
     pub fn overlay(&mut self, patch: &TableStyleParts) {
-        self.borders = match (self.borders, patch.borders) {
-            (Some(b), Some(p)) => Some(Borders {
-                top: p.top.or(b.top),
-                left: p.left.or(b.left),
-                bottom: p.bottom.or(b.bottom),
-                right: p.right.or(b.right),
-                between: p.between.or(b.between),
-                inside_v: p.inside_v.or(b.inside_v),
-            }),
+        let merge = |b: Option<Borders>, p: Option<Borders>| match (b, p) {
+            (Some(mut b), Some(p)) => {
+                b.overlay(&p);
+                Some(b)
+            }
             (b, p) => p.or(b),
         };
+        self.borders = merge(self.borders, patch.borders);
+        self.header_borders = merge(self.header_borders, patch.header_borders);
+        self.band_borders = merge(self.band_borders, patch.band_borders);
+        self.band_size = patch.band_size.or(self.band_size);
+        self.band_chr.overlay(&patch.band_chr);
         self.fill = patch.fill.or(self.fill);
         self.cell_margins = patch.cell_margins.or(self.cell_margins);
         self.header_fill = patch.header_fill.or(self.header_fill);
@@ -81,6 +110,16 @@ impl TableStyleParts {
         self.first_col_chr.overlay(&patch.first_col_chr);
         self.total_chr.overlay(&patch.total_chr);
         self.total_border_top = patch.total_border_top.or(self.total_border_top);
+        self.first_col_fill = patch.first_col_fill.or(self.first_col_fill);
+        self.first_col_borders = merge(self.first_col_borders, patch.first_col_borders);
+        self.last_col_fill = patch.last_col_fill.or(self.last_col_fill);
+        self.last_col_chr.overlay(&patch.last_col_chr);
+        self.last_col_borders = merge(self.last_col_borders, patch.last_col_borders);
+        self.total_fill = patch.total_fill.or(self.total_fill);
+        self.total_borders = merge(self.total_borders, patch.total_borders);
+        self.col_band_fill = patch.col_band_fill.or(self.col_band_fill);
+        self.col_band_chr.overlay(&patch.col_band_chr);
+        self.col_band_borders = merge(self.col_band_borders, patch.col_band_borders);
     }
 }
 
@@ -99,6 +138,9 @@ pub struct StyleSheet {
     /// Document defaults (`w:docDefaults`).
     pub default_chr: CharProps,
     pub default_para: ParaProps,
+    /// Preserve an explicit `w:pPrDefault`, even when empty. Omission leaves defaults to
+    /// the application; nonempty `default_para` is always written after spacing edits.
+    pub default_para_present: bool,
     pub styles: Vec<Style>,
 }
 
@@ -126,13 +168,13 @@ fn color(c: Rgb) -> Option<TextColor> {
 
 impl StyleSheet {
     pub fn empty() -> Self {
-        StyleSheet { default_chr: CharProps::default(), default_para: ParaProps::default(), styles: Vec::new() }
+        StyleSheet { default_chr: CharProps::default(), default_para: ParaProps::default(), default_para_present: true, styles: Vec::new() }
     }
 
     /// The built-in style set used for new documents.
     pub fn builtin() -> Self {
         let mut s = StyleSheet {
-            default_chr: CharProps { font: Some(BODY_FONT.into()), size: Some(12.0), kern: Some(0.0), lang: Some("en-US".into()), ..chr() },
+            default_chr: CharProps { font: Some(BODY_FONT.into()), size: Some(12.0), kern: Some(1.0), lang: Some("en-US".into()), ..chr() },
             default_para: ParaProps {
                 space_after: Some(8.0),
                 space_before: Some(0.0),
@@ -140,6 +182,7 @@ impl StyleSheet {
                 widow_control: Some(true),
                 ..para()
             },
+            default_para_present: true,
             styles: Vec::new(),
         };
         let mut add = |st: Style| s.styles.push(st);
@@ -401,6 +444,19 @@ impl StyleSheet {
         out.reverse();
         out
     }
+    /// Which indents (left, first line) of a paragraph that gets its list from style `id` the style
+    /// chain sets over the list level's own. Word applies the level's indents on top of the most
+    /// derived style that gives a list, so that style and the ones based on it win over the level,
+    /// and the styles it is based on don't (Heading 3 with its own left indent on Heading 2's
+    /// list). `(false, false)` when no style in the chain gives a list.
+    pub fn indents_over_list(&self, id: &str) -> (bool, bool) {
+        let chain = self.chain(id);
+        let Some(k) = chain.iter().rposition(|s| s.para.numbering.is_some()) else { return (false, false) };
+        let set = |v: Option<f32>, chars: Option<f32>| v.is_some() || chars.is_some_and(|c| c != 0.0);
+        chain.get(k..).unwrap_or_default().iter().fold((false, false), |(l, f), s| {
+            (l || set(s.para.indent_left, s.para.indent_left_chars), f || set(s.para.indent_first, s.para.indent_first_chars))
+        })
+    }
     /// Table style `id` with its based-on chain merged, base styles first (`None` when there is no
     /// such table style). Styles of other kinds in the chain are skipped.
     pub fn table_style(&self, id: &str) -> Option<TableStyleProps> {
@@ -426,6 +482,25 @@ impl StyleSheet {
             Some(s) => *s = st,
             None => self.styles.push(st),
         }
+    }
+    /// Remove style `id` and return it. Styles based on it are rebased onto its own base, and
+    /// `next` / `linked` references to it are dropped. Text that uses it is the document's to
+    /// retarget ([`crate::Document::restyle`]).
+    pub fn remove(&mut self, id: &str) -> Option<Style> {
+        let i = self.styles.iter().position(|s| s.id == id)?;
+        let gone = self.styles.remove(i);
+        for s in &mut self.styles {
+            if s.based_on.as_deref() == Some(id) {
+                s.based_on = gone.based_on.clone().filter(|b| *b != s.id);
+            }
+            if s.next.as_deref() == Some(id) {
+                s.next = None;
+            }
+            if s.linked.as_deref() == Some(id) {
+                s.linked = None;
+            }
+        }
+        Some(gone)
     }
     /// An id not used yet, derived from a display name.
     pub fn new_id(&self, name: &str) -> String {
@@ -528,6 +603,18 @@ mod tests {
         let g = s.gallery();
         assert_eq!(g.first().map(|s| s.id.as_str()), Some("Normal"));
         assert!(g.iter().any(|s| s.id == "Heading1"));
+    }
+
+    #[test]
+    fn older_serialized_styles_keep_explicit_defaults() {
+        let mut value = serde_json::to_value(StyleSheet::empty()).unwrap();
+        value.as_object_mut().unwrap().remove("defaultParaPresent");
+        let sheet: StyleSheet = serde_json::from_value(value).unwrap();
+        assert!(sheet.default_para_present);
+        let mut omitted = sheet;
+        omitted.default_para_present = false;
+        let again: StyleSheet = serde_json::from_str(&serde_json::to_string(&omitted).unwrap()).unwrap();
+        assert_eq!(again, omitted);
     }
 
     #[test]

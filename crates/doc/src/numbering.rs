@@ -34,6 +34,15 @@ pub struct Level {
     pub chr: CharProps,
     /// Restart after a higher level (true = after any higher level, the default).
     pub restart: bool,
+    /// Restart only after this level (1-based, Word's `w:lvlRestart`): a level 3 that restarts
+    /// after level 1 keeps counting across level 2 items. `None` restarts after the level just
+    /// above. Ignored when `restart` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_after: Option<u8>,
+    /// The tab stop that follows the number (Word's "Add tab stop at"), points from the
+    /// paragraph's left edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab: Option<f32>,
     /// Show all levels as decimal (legal numbering).
     pub legal: bool,
     /// Paragraph style linked to this level (e.g. Heading 1 for outline numbering).
@@ -52,6 +61,8 @@ impl Default for Level {
             suffix: LevelSuffix::Tab,
             chr: CharProps::default(),
             restart: true,
+            restart_after: None,
+            tab: None,
             legal: false,
             style: None,
         }
@@ -267,8 +278,13 @@ impl Counters {
                 *v = def.start;
             }
         }
-        for deeper in st.iter_mut().skip(lv + 1) {
-            *deeper = 0;
+        // Deeper levels restart, unless they never restart or only restart after a level above
+        // this one (Word's lvlRestart).
+        for (d, deeper) in st.iter_mut().enumerate().skip(lv + 1) {
+            let restarts = level_def(d).is_none_or(|l| l.restart && l.restart_after.is_none_or(|k| lv < k as usize));
+            if restarts {
+                *deeper = 0;
+            }
         }
         let vals = *st;
         if def.format == NumFormat::Bullet {
@@ -284,7 +300,13 @@ impl Counters {
                 let k = (d as usize).saturating_sub(1).min(8);
                 let val = vals.get(k).copied().unwrap_or(0);
                 let val = if val == 0 { level_def(k).map(|l| l.start).unwrap_or(1) } else { val };
-                let fmt = if def.legal && k != lv { NumFormat::Decimal } else { level_def(k).map(|l| l.format).unwrap_or(NumFormat::Decimal) };
+                // Legal numbering (w:isLgl) shows every level in Arabic digits, whatever its own
+                // format (二 of a Chinese outline becomes 2 in "2.1").
+                let fmt = match level_def(k).map(|l| l.format).unwrap_or(NumFormat::Decimal) {
+                    NumFormat::DecimalZero => NumFormat::DecimalZero,
+                    _ if def.legal => NumFormat::Decimal,
+                    f => f,
+                };
                 label.push_str(&fmt.format(val));
             } else {
                 label.push(c);
@@ -320,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn levels_restart_only_after_their_restart_level() {
+        let mut n = Numbering::default();
+        let id = n.add_list(ListKind::Legal);
+        if let Some(a) = n.abstracts.first_mut() {
+            // Level 3 restarts only after level 1; level 2 never restarts.
+            a.levels[2].restart_after = Some(1);
+            a.levels[2].text = "(%3)".into();
+            a.levels[1].restart = false;
+        }
+        let mut c = Counters::default();
+        let mut l = |lv| c.next_label(&n, id, lv).unwrap().0;
+        assert_eq!(l(0), "1.");
+        assert_eq!(l(1), "1.1.");
+        assert_eq!(l(2), "(1)");
+        assert_eq!(l(1), "1.2.");
+        assert_eq!(l(2), "(2)", "level 2 doesn't restart level 3");
+        assert_eq!(l(0), "2.");
+        assert_eq!(l(1), "2.3.", "level 2 never restarts");
+        assert_eq!(l(2), "(1)", "level 1 restarts level 3");
+    }
+
+    #[test]
     fn numbered_labels() {
         let mut n = Numbering::default();
         let id = n.add_list(ListKind::Numbered);
@@ -331,6 +375,32 @@ mod tests {
         assert_eq!(c.next_label(&n, id, 0).unwrap().0, "3.");
         assert_eq!(c.next_label(&n, id, 1).unwrap().0, "a.");
         assert!(c.next_label(&n, 999, 0).is_none());
+    }
+
+    #[test]
+    fn east_asian_labels_and_legal_numbering() {
+        // A Chinese outline: 第一章, then "一、" items, and a legal level showing 1.1.
+        let mut n = Numbering::default();
+        let id = n.add_list(ListKind::Numbered);
+        if let Some(a) = n.abstracts.first_mut() {
+            a.levels[0] = Level { format: NumFormat::ChineseCounting, text: "第%1章".into(), ..Level::default() };
+            a.levels[1] = Level { format: NumFormat::ChineseCounting, text: "%2、".into(), ..Level::default() };
+            a.levels[2] = Level { format: NumFormat::ChineseCounting, text: "%1.%2.%3".into(), legal: true, ..Level::default() };
+            a.levels[3] = Level { format: NumFormat::ChineseCounting, text: "（%4）".into(), ..Level::default() };
+        }
+        let mut c = Counters::default();
+        let mut l = |lv| c.next_label(&n, id, lv).unwrap().0;
+        assert_eq!(l(0), "第一章");
+        assert_eq!(l(1), "一、");
+        assert_eq!(l(1), "二、");
+        assert_eq!(l(1), "三、");
+        assert_eq!(l(2), "1.3.1", "legal numbering is decimal on every level");
+        assert_eq!(l(3), "（一）");
+        for _ in 0..9 {
+            l(3);
+        }
+        assert_eq!(l(3), "（十一）");
+        assert_eq!(l(0), "第二章");
     }
 
     #[test]

@@ -17,6 +17,51 @@ fn word_count() {
 }
 
 #[test]
+fn word_count_includes_numbered_list_labels_but_not_bullets() {
+    let mut d = Document::new();
+    let num_id = d.numbering.add_list(ListKind::Numbered);
+    let bul_id = d.numbering.add_list(ListKind::Bullet);
+
+    let mut p1 = Paragraph::with_text("Apple", CharProps::default());
+    p1.props.numbering = Some(props::NumRef { num: num_id, level: 0 });
+    let mut p2 = Paragraph::with_text("Banana", CharProps::default());
+    p2.props.numbering = Some(props::NumRef { num: num_id, level: 0 });
+
+    let mut p3 = Paragraph::with_text("Cherry", CharProps::default());
+    p3.props.numbering = Some(props::NumRef { num: bul_id, level: 0 });
+    let mut p4 = Paragraph::with_text("Date", CharProps::default());
+    p4.props.numbering = Some(props::NumRef { num: bul_id, level: 0 });
+
+    d.body = vec![Arc::new(Block::Para(p1)), Arc::new(Block::Para(p2)), Arc::new(Block::Para(p3)), Arc::new(Block::Para(p4))];
+
+    // Numbered items contribute 2 words each (label + text) = 4 words.
+    // Bullet items contribute 1 word each (bullet marker is not a word + text) = 2 words.
+    assert_eq!(d.word_count(), 6);
+    let plain = d.plain_text(StoryRef::Body);
+    assert_eq!(plain, "Apple\nBanana\nCherry\nDate");
+}
+
+#[test]
+fn word_count_includes_numbered_labels_with_nothing_suffix() {
+    let mut d = Document::new();
+    let num_id = d.numbering.add_list(ListKind::Numbered);
+    let aid = d.numbering.num(num_id).expect("list num exists").abstract_id;
+    let a = d.numbering.abstracts.iter_mut().find(|a| a.id == aid).expect("abstract num exists");
+    a.levels[0].suffix = numbering::LevelSuffix::Nothing;
+
+    let mut p1 = Paragraph::with_text("Apple", CharProps::default());
+    p1.props.numbering = Some(props::NumRef { num: num_id, level: 0 });
+    let mut p2 = Paragraph::with_text("Banana Cherry", CharProps::default());
+    p2.props.numbering = Some(props::NumRef { num: num_id, level: 0 });
+    d.body = vec![Arc::new(Block::Para(p1)), Arc::new(Block::Para(p2))];
+
+    // Label "1." and text "Apple" must each be counted as a separate word (2 words),
+    // and label "2." and text "Banana Cherry" as 3 words (total: 5 words),
+    // even though LevelSuffix::Nothing produces no visible separator between label and text.
+    assert_eq!(d.word_count(), 5);
+}
+
+#[test]
 fn sections_and_section_mut() {
     let mut d = Document::from_text("a\nb\nc");
     if let Some(Block::Para(p)) = d.body.get_mut(0).map(Arc::make_mut) {
@@ -88,6 +133,9 @@ fn text_box_anchor_finds_the_owning_shape() {
         stroke_width: 0.75,
         float: Default::default(),
         story,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
     };
     // A plain shape before it doesn't count.
     d.insert_object(&Pos::body(0, 0), shape(None), &CharProps::default()).unwrap();
@@ -108,6 +156,9 @@ fn word_count_including_notes_counts_used_boxes_and_notes_only() {
         stroke_width: 0.75,
         float: Default::default(),
         story: Some(story),
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
     };
     let para_of = |t: &str| vec![para_block(Paragraph::with_text(t, CharProps::default()))];
     let boxed = d.add_part(PartKind::TextBox, para_of("three four"));
@@ -146,6 +197,9 @@ fn counted_stories_survive_self_nested_boxes() {
         stroke_width: 0.0,
         float: Default::default(),
         story: Some(id),
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
     };
     d.insert_object(&Pos::body(0, 0), shape.clone(), &CharProps::default()).unwrap();
     d.insert_object(&Pos { story: StoryRef::Part(id), path: Path::top(0), off: 0 }, shape, &CharProps::default()).unwrap();
@@ -163,6 +217,9 @@ fn prune_text_boxes_drops_only_unshown_ones() {
         stroke_width: 0.0,
         float: Default::default(),
         story: Some(story),
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
     };
     let para_of = |t: &str| vec![para_block(Paragraph::with_text(t, CharProps::default()))];
     let mut d = Document::from_text("body");
@@ -195,6 +252,9 @@ fn notes_in_text_box_follow_nested_boxes_once() {
         stroke_width: 0.0,
         float: Default::default(),
         story: Some(story),
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
     };
     let note = |id| InlineObject::NoteRef { kind: para::NoteKind::Footnote, id, custom: String::new() };
     let mut d = Document::new();

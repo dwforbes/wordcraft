@@ -8,12 +8,14 @@
 //! capped), so hostile input yields an error or a best-effort document, never a panic.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod drawing;
 mod fib;
 mod fkp;
 mod fmt;
 mod list;
 mod media;
 mod notes;
+mod officeart;
 mod piece;
 mod sections;
 mod sprm;
@@ -139,7 +141,35 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocbinError> {
         sheet: &sheet,
         notes: &[],
         marks: &[],
+        drawn: &[],
+        sect_ends: &[],
     };
+
+    // Drawings: text box stories become parts first, then the floating shapes and pictures
+    // anchored in the main document and the headers, found by their anchor CP while walking.
+    let txbx_base = edn_base.saturating_add(fib.ccp.edn);
+    let hdr_txbx_base = txbx_base.saturating_add(fib.ccp.txbx);
+    let art = fib
+        .pair(fib::pair::DGG_INFO)
+        .and_then(|(f, l)| table.get(f as usize..(f as usize).saturating_add(l as usize)))
+        .map(officeart::content)
+        .unwrap_or_default();
+    let mut tb_stories = std::collections::HashMap::new();
+    for (pair, base, len) in [(fib::pair::PLCF_TXBX_TXT, txbx_base, fib.ccp.txbx), (fib::pair::PLCF_HDR_TXBX_TXT, hdr_txbx_base, fib.ccp.hdr_txbx)] {
+        for (spid, ab) in drawing::textbox_stories(&table, fib.pair(pair)) {
+            let Some((a, b)) = story(base, len, ab) else { continue };
+            if doc.parts.len() >= MAX_PARTS || tb_stories.contains_key(&spid) {
+                continue;
+            }
+            let blocks = table::assemble(walk(&ctx, a, b, &mut pics));
+            tb_stories.insert(spid, doc.add_part(PartKind::TextBox, blocks));
+        }
+    }
+    let build = drawing::Build { bstore: &art.bstore, delay: &word, stories: &tb_stories };
+    let mut drawn = drawing::anchors(&table, fib.pair(fib::pair::PLC_SPA_MOM), 0, &art.main, &build, &mut pics);
+    drawn.extend(drawing::anchors(&table, fib.pair(fib::pair::PLC_SPA_HDR), hdd_base, &art.header, &build, &mut pics));
+    drawn.sort_by_key(|(cp, _)| *cp);
+    let ctx = WalkCtx { drawn: &drawn, ..ctx };
 
     // Header and footer parts: skip the six separator stories, then six stories per section
     // in the order even header, odd (default) header, even footer, odd (default) footer,
@@ -186,7 +216,9 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocbinError> {
     // Sorted so the main walk finds each reference by binary search.
     note_links.sort_by_key(|(cp, _, _)| *cp);
     let marks = notes::parse_bookmarks(&table, &fib);
-    let ctx = WalkCtx { notes: &note_links, marks: &marks, ..ctx };
+    let mut sect_ends: Vec<u32> = sects.iter().map(|s| s.end_cp).collect();
+    sect_ends.sort_unstable();
+    let ctx = WalkCtx { notes: &note_links, marks: &marks, sect_ends: &sect_ends, ..ctx };
 
     // Sections: each section's properties attach to the paragraph that ends it (its story of
     // header/footer parts included); the section reaching the end of the text is the final one.
@@ -246,6 +278,11 @@ struct WalkCtx<'a> {
     notes: &'a [(u32, NoteKind, u32)],
     /// Bookmark boundaries (main-document CPs), sorted for a sequential walk.
     marks: &'a [(u32, notes::Mark)],
+    /// Floating shapes and pictures by anchor CP (absolute), sorted.
+    drawn: &'a [(u32, InlineObject)],
+    /// Where sections end (main-document CPs, sorted): the section mark (0x0C) just before
+    /// each ends the section's last paragraph, it isn't a page break inside it.
+    sect_ends: &'a [u32],
 }
 
 /// State while assembling one paragraph from per-CP formatting.
@@ -319,8 +356,10 @@ fn walk(ctx: &WalkCtx, cp_start: u32, cp_end: u32, pics: &mut media::Pictures) -
                 continue;
             }
         };
+        // A section mark (0x0C) at a section's end is that section's last paragraph mark.
+        let section_mark = c == '\u{C}' && ctx.sect_ends.binary_search(&cp.saturating_add(1)).is_ok();
         match c {
-            '\r' | '\u{7}' => {
+            '\r' | '\u{7}' | '\u{C}' if c != '\u{C}' || section_mark => {
                 // Paragraph mark: its PAPX covers the FC range of the paragraph it ends, so
                 // querying at the mark's own FC finds that paragraph's properties.
                 let fc_mark = ctx.pieces.fc_of_cp(cp).unwrap_or(0);
@@ -405,11 +444,27 @@ fn walk(ctx: &WalkCtx, cp_start: u32, cp_end: u32, pics: &mut media::Pictures) -
                 let fc = ctx.pieces.fc_of_cp(cp).unwrap_or(0);
                 let fc_pic = pic_location(ctx.chpx_bins.chpx(ctx.word, fc));
                 match fc_pic.and_then(|at| pics.get(ctx.data, at)) {
-                    Some((key, w, h)) => {
+                    Some(p) => {
                         pb.push('\u{FFFC}', CharProps::default());
-                        pb.objects.push(InlineObject::Image { media: key, w, h, alt: String::new(), float: Default::default(), crop: [0.0; 4] });
+                        pb.objects.push(InlineObject::Image {
+                            media: p.key,
+                            w: p.w,
+                            h: p.h,
+                            alt: p.alt,
+                            float: Default::default(),
+                            crop: p.crop,
+                            ole: None,
+                        });
                     }
                     None => pics.dropped(cp),
+                }
+            }
+            '\u{8}' => {
+                // Drawn object anchor: the floating shape or picture anchored at this CP.
+                let at = ctx.drawn.partition_point(|(c, _)| *c < cp);
+                for (_, obj) in ctx.drawn.get(at..).unwrap_or_default().iter().take_while(|(c, _)| *c == cp) {
+                    pb.push('\u{FFFC}', CharProps::default());
+                    pb.objects.push(obj.clone());
                 }
             }
             '\u{2}' => {
@@ -466,7 +521,7 @@ fn finish_field(pb: &mut ParaBuild, f: FieldBuild) {
         return;
     }
     pb.push('\u{FFFC}', CharProps::default());
-    pb.objects.push(InlineObject::Field { instr, result: result_text, locked: false });
+    pb.objects.push(InlineObject::Field { instr, result: result_text, locked: false, code: false });
 }
 
 /// `HYPERLINK "url"` / `HYPERLINK url \l "bookmark"` → the model link target
@@ -511,13 +566,14 @@ fn pic_location(chpx: &[u8]) -> Option<u32> {
     None
 }
 
-/// `sprmPIlfo` operand → the num id, if the paragraph is in a list. Values 0xF802-0xFFFF are
-/// the negation of a 1-based index and keep the paragraph's own indents, which we do by
-/// leaving the level's indents out of the paragraph (they never enter `ParaProps` anyway).
+/// `sprmPIlfo` operand (a signed 16-bit value, [MS-DOC] §2.6.2) → the num id, if the
+/// paragraph is in a list. 0x0001-0x07FE is a 1-based LFO index; 0xF802-0xFFFF (-2046..=-1)
+/// is the negation of one and keeps the paragraph's own indents, which we do by leaving the
+/// level's indents out of the paragraph (they never enter `ParaProps` anyway). 0 and 0xF801
+/// mean "not in a list".
 fn num_of(ilfo: i32) -> Option<u32> {
     match ilfo {
-        0x0001..=0x07FE => Some(ilfo as u32),
-        0xF802..=0xFFFF => Some((-(ilfo as i16)) as i32 as u32),
+        0x0001..=0x07FE | -0x07FE..=-1 => Some(ilfo.unsigned_abs()),
         _ => None,
     }
 }

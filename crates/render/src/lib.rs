@@ -13,6 +13,10 @@ use wordcraft_doc::props::Rgb;
 use wordcraft_fonts::FontDb;
 use wordcraft_layout::Page;
 use wordcraft_layout::display::{DisplayOptions, Draw, Stroke, page_display};
+use wordcraft_layout::wordart::ArtPaint;
+use wordcraft_metafile::{Item, Picture, PlacedItem, Seg};
+
+pub mod icon_lib;
 
 /// Worker threads for rasterising (0 on the web, where there are no threads).
 pub fn default_threads() -> u16 {
@@ -102,77 +106,115 @@ fn color(c: Rgb, alpha: f32) -> peniko::Color {
     peniko::Color::from_rgba8(c.0, c.1, c.2, (alpha.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
-/// Decoded pictures kept between renders, least recently used dropped first beyond this.
-const IMAGE_CACHE_BYTES: usize = 256 << 20;
-/// And at most this many.
-const IMAGE_CACHE_ENTRIES: usize = 256;
+/// Upper bound on the bytes the two decoded-media caches keep together (about 256 MB), half each;
+/// past its half a cache lets go of the entries used longest ago.
+const CACHE_BYTES: usize = 256 * 1024 * 1024 / 2;
+/// Upper bound on cached entries per cache.
+const CACHE_ENTRIES: usize = 256;
 
-/// Decoded images by media key (and content pointer), shared across renders.
-struct ImageCache {
-    /// (image, bytes, last use).
-    map: HashMap<(String, usize), (Option<Arc<Pixmap>>, usize, u64)>,
+/// Decoded media by media key, shared across renders, with an approximate byte budget. An entry holds
+/// the source bytes it was decoded from, so a hit needs the same allocation (`Arc::ptr_eq`), and that
+/// allocation cannot be freed and its address reused while the entry lives.
+struct MediaCache<T> {
+    map: HashMap<String, Entry<T>>,
     bytes: usize,
+    /// Counts lookups, to find the entry used longest ago.
     tick: u64,
-    budget: usize,
 }
 
-impl Default for ImageCache {
+impl<T> Default for MediaCache<T> {
     fn default() -> Self {
-        ImageCache { map: HashMap::new(), bytes: 0, tick: 0, budget: IMAGE_CACHE_BYTES }
+        MediaCache { map: HashMap::new(), bytes: 0, tick: 0 }
     }
 }
 
-impl ImageCache {
-    fn get(&mut self, k: &(String, usize)) -> Option<Option<Arc<Pixmap>>> {
-        self.tick += 1;
+struct Entry<T> {
+    src: Arc<Vec<u8>>,
+    val: T,
+    size: usize,
+    used: u64,
+}
+
+impl<T: Clone> MediaCache<T> {
+    fn get(&mut self, key: &str, src: &Arc<Vec<u8>>) -> Option<T> {
+        self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
-        self.map.get_mut(k).map(|e| {
-            e.2 = tick;
-            e.0.clone()
+        let e = self.map.get_mut(key)?;
+        Arc::ptr_eq(&e.src, src).then(|| {
+            e.used = tick;
+            e.val.clone()
         })
     }
 
-    fn insert(&mut self, k: (String, usize), pm: Option<Arc<Pixmap>>) {
-        let size = pm.as_ref().map_or(0, |p| usize::from(p.width()).saturating_mul(usize::from(p.height())).saturating_mul(4));
-        while !self.map.is_empty() && (self.bytes.saturating_add(size) > self.budget || self.map.len() >= IMAGE_CACHE_ENTRIES) {
-            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k.clone()) else { break };
+    /// Stores `val` (about `size` bytes) with its source, whose bytes the entry keeps alive and so counts
+    /// too. Lets go of the entries used longest ago first while the budget or entry cap would be
+    /// passed; an entry larger than the whole budget is not kept.
+    fn insert(&mut self, key: &str, src: &Arc<Vec<u8>>, val: T, size: usize) {
+        let size = size.saturating_add(src.len());
+        if size > CACHE_BYTES {
+            return;
+        }
+        if let Some(old) = self.map.remove(key) {
+            self.bytes = self.bytes.saturating_sub(old.size);
+        }
+        while !self.map.is_empty() && (self.map.len() >= CACHE_ENTRIES || self.bytes.saturating_add(size) > CACHE_BYTES) {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone()) else { break };
             if let Some(e) = self.map.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(e.1);
+                self.bytes = self.bytes.saturating_sub(e.size);
             }
         }
-        self.tick += 1;
+        self.tick = self.tick.wrapping_add(1);
+        self.map.insert(key.to_string(), Entry { src: src.clone(), val, size, used: self.tick });
         self.bytes = self.bytes.saturating_add(size);
-        if let Some(old) = self.map.insert(k, (pm, size, self.tick)) {
-            self.bytes = self.bytes.saturating_sub(old.1);
-        }
     }
 }
 
-fn image_cache() -> &'static Mutex<ImageCache> {
-    static C: std::sync::OnceLock<Mutex<ImageCache>> = std::sync::OnceLock::new();
-    C.get_or_init(|| Mutex::new(ImageCache::default()))
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Decoded pictures held for rendering: (count, bytes).
+fn images() -> &'static Mutex<MediaCache<Option<Arc<Pixmap>>>> {
+    static C: std::sync::OnceLock<Mutex<MediaCache<Option<Arc<Pixmap>>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(MediaCache::default()))
+}
+
+fn vectors() -> &'static Mutex<MediaCache<Option<Arc<Vector>>>> {
+    static C: std::sync::OnceLock<Mutex<MediaCache<Option<Arc<Vector>>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(MediaCache::default()))
+}
+
+/// Decoded pictures (raster and vector) held for rendering: (count, bytes).
 pub fn image_cache_usage() -> (usize, usize) {
-    let c = image_cache().lock().unwrap_or_else(|e| e.into_inner());
-    (c.map.len(), c.bytes)
+    let (i, v) = (lock(images()), lock(vectors()));
+    (i.map.len().saturating_add(v.map.len()), i.bytes.saturating_add(v.bytes))
 }
 
 /// Forget decoded pictures (they are decoded again when next drawn).
 pub fn clear_image_cache() {
-    *image_cache().lock().unwrap_or_else(|e| e.into_inner()) = ImageCache::default();
+    *lock(images()) = MediaCache::default();
+    *lock(vectors()) = MediaCache::default();
 }
 
 /// Decode an encoded image to a premultiplied pixmap.
 pub fn decode_pixmap(bytes: &[u8]) -> Option<Pixmap> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
+    premul_pixmap(w, h, img.as_raw())
+}
+
+/// A premultiplied pixmap from straight RGBA8 rows. None for empty, oversized or mis-sized input
+/// (the pixmap constructor asserts the length).
+fn premul_pixmap(w: u32, h: u32, rgba: &[u8]) -> Option<Pixmap> {
     if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
         return None;
     }
-    let data: Vec<vello_cpu::color::PremulRgba8> = img
-        .pixels()
+    if rgba.len() != (w as usize * h as usize).saturating_mul(4) {
+        return None;
+    }
+    let data: Vec<vello_cpu::color::PremulRgba8> = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             let a = p[3] as u16;
             let m = |c: u8| ((c as u16 * a + 127) / 255) as u8;
@@ -187,14 +229,144 @@ pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
 }
 
+/// The natural size in points of a Windows Metafile or Enhanced Metafile picture, and the file
+/// extension it is stored under (`"wmf"` or `"emf"`), or None for anything else (#802). Very large
+/// frames are scaled down to 22 inches on the longer side, keeping the shape.
+pub fn metafile_size(bytes: &[u8]) -> Option<(f32, f32, &'static str)> {
+    if !wordcraft_metafile::is_metafile(bytes) {
+        return None;
+    }
+    let pic = wordcraft_metafile::parse(bytes).ok()?;
+    let (w, h) = (pic.width, pic.height);
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let k = (1584.0 / w.max(h)).min(1.0);
+    // An EMF starts with its header record, type 1.
+    let ext = if bytes.get(..4) == Some(&[1, 0, 0, 0]) { "emf" } else { "wmf" };
+    Some((w * k, h * k, ext))
+}
+
+/// A metafile (WMF/EMF) picture, parsed once. The geometry comes placed by the metafile crate; the
+/// bitmaps are pixmaps, one per picture item (None for paths and undecodable bitmaps).
+struct Vector {
+    pic: Picture,
+    pixmaps: Vec<Option<Arc<Pixmap>>>,
+}
+
+impl Vector {
+    /// Approximate memory held: pixels and path segments.
+    fn bytes(&self) -> usize {
+        let px: usize = self.pixmaps.iter().flatten().map(|p| p.width() as usize * p.height() as usize * 4).sum();
+        let segs: usize = self
+            .pic
+            .items
+            .iter()
+            .map(|it| match it {
+                Item::Path { segs, .. } => segs.len() * std::mem::size_of::<Seg>(),
+                Item::Bitmap { .. } => 0,
+            })
+            .sum();
+        px + segs
+    }
+}
+
+/// The metafile picture for a media key. None when the bytes are not a metafile or do not parse, so
+/// the caller falls back to the raster path (and the grey box).
+fn vector_for(doc: &Document, key: &str) -> Option<Arc<Vector>> {
+    let bytes = doc.media.get(key)?;
+    if !wordcraft_metafile::is_metafile(bytes) {
+        return None;
+    }
+    if let Some(v) = lock(vectors()).get(key, bytes) {
+        return v;
+    }
+    let v = build_vector(bytes).map(Arc::new);
+    if v.is_none() {
+        log::warn!("picture `{key}` is a metafile that could not be read");
+    }
+    let size = v.as_ref().map_or(0, |v| v.bytes());
+    lock(vectors()).insert(key, bytes, v.clone(), size);
+    v
+}
+
+/// Parses a metafile and decodes its bitmaps. None when the picture has no usable size.
+fn build_vector(bytes: &[u8]) -> Option<Vector> {
+    let mut pic = wordcraft_metafile::parse(bytes).ok()?;
+    if !pic.has_size() {
+        return None;
+    }
+    // The pixels move into the pixmaps; the picture keeps only the geometry.
+    let pixmaps = pic.items.iter_mut().map(|it| it.take_pixels().and_then(|(w, h, px)| premul_pixmap(w, h, &px)).map(Arc::new)).collect();
+    Some(Vector { pic, pixmaps })
+}
+
+fn rgba_color(c: [u8; 4]) -> peniko::Color {
+    peniko::Color::from_rgba8(c[0], c[1], c[2], c[3])
+}
+
+/// Draws a metafile picture into `r` (page points): fills and strokes in page space (so strokes keep
+/// their width under non-uniform scaling), bitmaps stretched, all clipped to `r` and faded by `alpha`.
+/// Strokes have round caps and joins, as GDI draws them, and are at least one device pixel wide, so
+/// cosmetic (width 0) pens show as hairlines at any zoom.
+fn draw_vector(ctx: &mut RenderContext, v: &Vector, r: &kurbo::Rect, crop: &[f32; 4], alpha: f32, view: Affine) {
+    ctx.set_transform(view);
+    let alpha = if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 1.0 };
+    let faded = alpha < 1.0;
+    if faded {
+        ctx.push_opacity_layer(alpha);
+    }
+    ctx.push_clip_layer(&r.to_path(0.1));
+    let pixel = device_pixel(view);
+    for it in v.pic.place(*r, *crop) {
+        match it {
+            PlacedItem::Path { path, fill, stroke, even_odd } => {
+                if let Some(f) = fill {
+                    ctx.set_paint(rgba_color(f));
+                    ctx.set_fill_rule(if even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
+                    ctx.fill_path(&path);
+                }
+                if let Some((s, w)) = stroke {
+                    ctx.set_paint(rgba_color(s));
+                    ctx.set_stroke(kurbo::Stroke::new(w.max(pixel)).with_caps(kurbo::Cap::Round).with_join(kurbo::Join::Round));
+                    ctx.stroke_path(&path);
+                }
+            }
+            PlacedItem::Bitmap { index, rect } => {
+                let Some(Some(pm)) = v.pixmaps.get(index) else { continue };
+                let (pw, ph) = (pm.width().max(1) as f64, pm.height().max(1) as f64);
+                ctx.set_paint(vello_cpu::Image {
+                    image: vello_cpu::ImageSource::Pixmap(pm.clone()),
+                    sampler: peniko::ImageSampler::default().with_quality(peniko::ImageQuality::Medium),
+                });
+                ctx.set_paint_transform(Affine::translate((rect.x0, rect.y0)) * Affine::scale_non_uniform(rect.width() / pw, rect.height() / ph));
+                ctx.fill_rect(&rect);
+                ctx.reset_paint_transform();
+            }
+        }
+    }
+    ctx.set_fill_rule(peniko::Fill::NonZero);
+    ctx.pop_layer();
+    if faded {
+        ctx.pop_layer();
+    }
+}
+
+/// One device pixel in page points under `view` (its mean axis scale); 1 for a degenerate transform.
+fn device_pixel(view: Affine) -> f64 {
+    let c = view.as_coeffs();
+    let scale = (c[0].hypot(c[1]) + c[2].hypot(c[3])) / 2.0;
+    if scale.is_finite() && scale > 1e-9 { 1.0 / scale } else { 1.0 }
+}
+
 fn pixmap_for(doc: &Document, key: &str) -> Option<Arc<Pixmap>> {
     let bytes = doc.media.get(key)?;
-    let ck = (key.to_string(), Arc::as_ptr(bytes) as usize);
-    if let Some(v) = image_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&ck) {
-        return v.clone();
+    if let Some(v) = lock(images()).get(key, bytes) {
+        return v;
     }
     let pm = decode_pixmap(bytes).map(Arc::new);
-    image_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(ck, pm.clone());
+    let size = pm.as_ref().map_or(0, |p| p.width() as usize * p.height() as usize * 4);
+    lock(images()).insert(key, bytes, pm.clone(), size);
     pm
 }
 
@@ -287,6 +459,44 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
     Rendered { width: w16 as u32, height: h16 as u32, pixels }
 }
 
+/// One line of `text` in `face` at `size` points, black on white, in a `w`×`h` point raster at
+/// `scale` pixels per point, starting `margin` points in with the baseline `margin` + the face's
+/// ascent down: a font list entry. Outlines come straight from the face, not the shared outline
+/// cache, so a face read just for the preview leaves nothing behind once dropped (#848).
+pub fn render_text_line(face: &wordcraft_fonts::FontFace, text: &str, size: f32, w: f32, h: f32, margin: f32, scale: f32) -> Rendered {
+    let fin = |v: f32, d: f32| if v.is_finite() && v >= 0.0 { v } else { d };
+    let (size, w, h, margin) = (fin(size, 12.0).min(1000.0) as f64, fin(w, 1.0), fin(h, 1.0), fin(margin, 0.0).min(1000.0) as f64);
+    let scale = if scale.is_finite() && scale > 0.0 { scale.min(16.0) } else { 1.0 };
+    let (w16, h16) = (((w * scale).ceil() as u32).clamp(1, MAX_SIDE) as u16, ((h * scale).ceil() as u32).clamp(1, MAX_SIDE) as u16);
+    let mut ctx = RenderContext::new_with(w16, h16, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
+    ctx.set_transform(Affine::IDENTITY);
+    ctx.set_paint(color(Rgb(255, 255, 255), 1.0));
+    ctx.fill_rect(&kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64));
+    ctx.set_paint(color(Rgb(0, 0, 0), 1.0));
+    let upem = if face.upem.is_finite() && face.upem > 0.0 { face.upem } else { 1000.0 };
+    let k = size / upem;
+    let view = Affine::scale(scale as f64);
+    let ascent = if face.ascent.is_finite() { face.ascent.clamp(0.0, upem * 4.0) } else { upem * 0.8 };
+    let baseline = margin + ascent * k;
+    let mut x = margin;
+    for g in wordcraft_fonts::shape(face, text, &[], |c| c) {
+        let o = face.glyph_outline(g.gid);
+        ctx.set_transform(view * Affine::translate((x + g.x_offset as f64 * k, baseline - g.y_offset as f64 * k)) * Affine::scale(k));
+        ctx.fill_path(&o);
+        x += g.x_advance as f64 * k;
+        if x > w as f64 {
+            break;
+        }
+    }
+    ctx.flush();
+    let mut pixels = vec![0u8; w16 as usize * h16 as usize * 4];
+    let mut res = Resources::new();
+    if let Some(pm) = vello_cpu::PixmapMut::new(w16, h16, &mut pixels) {
+        ctx.render(pm, &mut res);
+    }
+    Rendered { width: w16 as u32, height: h16 as u32, pixels }
+}
+
 fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordcraft_doc::Watermark, opts: &RenderOptions) {
     let r = wordcraft_fonts::word::resolve(&wm.font, false, false);
     let face = r.face;
@@ -296,11 +506,13 @@ fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordc
     if raw_w <= 0.0 {
         return;
     }
-    let diag = if wm.diagonal { ((page.w as f64).powi(2) + (page.h.min(2000.0) as f64).powi(2)).sqrt() } else { page.w as f64 };
+    // The document page, not a Print Markup area beside it.
+    let pw = (page.w - page.markup.max(0.0)).max(1.0) as f64;
+    let diag = if wm.diagonal { (pw.powi(2) + (page.h.min(2000.0) as f64).powi(2)).sqrt() } else { pw };
     let size = (diag * 0.5 / raw_w).min(200.0);
     let k = size / upem;
-    let angle = if wm.diagonal { -((page.h.min(2000.0) as f64) / page.w.max(1.0) as f64).atan() } else { 0.0 };
-    let base = Affine::translate((page.w as f64 / 2.0, page.h.min(2000.0) as f64 / 2.0))
+    let angle = if wm.diagonal { -((page.h.min(2000.0) as f64) / pw).atan() } else { 0.0 };
+    let base = Affine::translate((pw / 2.0, page.h.min(2000.0) as f64 / 2.0))
         * Affine::rotate(angle)
         * Affine::translate((-raw_w * size / 2.0, size * 0.35));
     ctx.set_paint(color(opts.ink(wm.color), if wm.semitransparent { 0.35 } else { 0.8 }));
@@ -329,8 +541,33 @@ pub fn stem_darkening(ppem: f64) -> f64 {
     FACTOR.iter().map(|f| (ppem * f).min(MAX_PX)).sum::<f64>() / 2.0
 }
 
+/// A wavy line from `a` to `b` at height `y`; at most 20 000 units long, so a huge extent can't make it endless.
+fn wave_path(a: f64, b: f64, y: f64, amp: f64) -> BezPath {
+    let step = amp * 2.0;
+    let mut p = BezPath::new();
+    p.move_to((a, y));
+    let mut x = a;
+    let mut up = true;
+    while x < b && x - a < 20_000.0 {
+        let nx = (x + step).min(b);
+        // Past about 1e16 a step no longer changes `x`: stop instead of pushing curves forever.
+        if nx <= x {
+            break;
+        }
+        p.quad_to(((x + nx) / 2.0, if up { y - amp } else { y + amp }), (nx, y));
+        x = nx;
+        up = !up;
+    }
+    p
+}
+
 fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visible: &kurbo::Rect, opts: &RenderOptions) {
     match it {
+        Draw::Figure { draws, .. } => {
+            for d in draws {
+                draw(ctx, doc, d, view, visible, opts);
+            }
+        }
         Draw::Fill { rect, color: c, alpha } => {
             let r = kurbo::Rect::new(rect.x as f64, rect.y as f64, rect.right() as f64, rect.bottom() as f64);
             if !r.overlaps(*visible) {
@@ -357,20 +594,9 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 ctx.stroke_path(&p);
             };
             if *stroke == Stroke::Wave {
-                let mut p = BezPath::new();
                 let (a, b) = ((*x0).min(*x1) as f64, (*x0).max(*x1) as f64);
-                let y = *y0 as f64;
                 let amp = (w * 1.2).max(0.8);
-                let step = amp * 2.0;
-                p.move_to((a, y));
-                let mut x = a;
-                let mut up = true;
-                while x < b && x - a < 20_000.0 {
-                    let nx = (x + step).min(b);
-                    p.quad_to(((x + nx) / 2.0, if up { y - amp } else { y + amp }), (nx, y));
-                    x = nx;
-                    up = !up;
-                }
+                let p = wave_path(a, b, *y0 as f64, amp);
                 ctx.set_stroke(kurbo::Stroke::new(w * 0.8));
                 ctx.stroke_path(&p);
                 return;
@@ -385,6 +611,10 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
             line(ctx, 0.0);
         }
         Draw::Glyphs { face, size, glyphs, color: c, alpha, synth_bold, synth_italic, .. } => {
+            // Invisible glyphs (WordArt letters are drawn from their outlines) carry text only.
+            if *alpha <= 0.0 {
+                return;
+            }
             let db = FontDb::global();
             let k = *size as f64 / face.upem.max(1.0);
             ctx.set_paint(color(opts.ink(*c), *alpha));
@@ -402,7 +632,9 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
             }
             for (gid, x, y) in glyphs {
                 let (gx, gy) = (*x as f64, *y as f64);
-                if gx < visible.x0 - 100.0 || gx > visible.x1 || gy < visible.y0 || gy > visible.y1 + 200.0 {
+                // Written so a NaN position is skipped too.
+                let near = gx >= visible.x0 - 100.0 && gx <= visible.x1 && gy >= visible.y0 && gy <= visible.y1 + 200.0;
+                if !near {
                     continue;
                 }
                 let o = db.outline(face, *gid);
@@ -416,7 +648,7 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 }
             }
         }
-        Draw::Mark { x, baseline, size, ch } => {
+        Draw::Mark { x, baseline, size, ch, color: mark } => {
             let face = wordcraft_fonts::word::resolve("Source Sans 3", false, false).face;
             let gid = face.glyph_for(*ch);
             let face = if gid == 0 {
@@ -430,13 +662,36 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
             let gid = face.glyph_for(*ch);
             let o = FontDb::global().outline(&face, gid);
             let k = *size as f64 / face.upem.max(1.0);
-            ctx.set_paint(color(opts.ink(opts.mark_color), 0.9));
+            ctx.set_paint(color(opts.ink(mark.unwrap_or(opts.mark_color)), 0.9));
             ctx.set_transform(view * Affine::translate((*x as f64, *baseline as f64)) * Affine::scale(k));
             ctx.fill_path(&o);
+        }
+        Draw::MarkText { x, baseline, size, text } => {
+            let base_face = wordcraft_fonts::word::resolve("Source Sans 3", false, false).face;
+            ctx.set_paint(color(opts.ink(opts.mark_color), 0.9));
+            let mut gx = *x as f64;
+            for ch in text.chars() {
+                let mut face = base_face;
+                if face.glyph_for(ch) == 0
+                    && let Some(f) = FontDb::global().fallback_for(ch, face.id())
+                {
+                    face = wordcraft_fonts::FaceRef::of(&f);
+                }
+                let gid = face.glyph_for(ch);
+                let k = *size as f64 / face.upem.max(1.0);
+                let o = FontDb::global().outline(&face, gid);
+                ctx.set_transform(view * Affine::translate((gx, *baseline as f64)) * Affine::scale(k));
+                ctx.fill_path(&o);
+                gx += face.advance(gid) * k;
+            }
         }
         Draw::Image { rect, media, crop, alpha } => {
             let r = kurbo::Rect::new(rect.x as f64, rect.y as f64, rect.right() as f64, rect.bottom() as f64);
             if !r.overlaps(*visible) {
+                return;
+            }
+            if let Some(v) = vector_for(doc, media) {
+                draw_vector(ctx, &v, &r, crop, *alpha, view);
                 return;
             }
             let Some(pm) = pixmap_for(doc, media) else {
@@ -469,10 +724,109 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 ctx.pop_layer();
             }
         }
-        Draw::Shape { rect, kind, fill, stroke, stroke_width } => {
+        Draw::Path { segs, fill, stroke, stroke_width } => {
+            let path = wordcraft_layout::display::seg_path(segs);
+            if path.elements().is_empty() {
+                return;
+            }
+            ctx.set_transform(view);
+            if let Some(f) = fill {
+                ctx.set_paint(color(opts.ink(*f), 1.0));
+                ctx.fill_path(&path);
+            }
+            if let Some(s) = stroke {
+                // Width 0 (or none) is a hairline.
+                let w = if stroke_width.is_finite() && *stroke_width > 0.0 { stroke_width.clamp(0.25, 200.0) } else { 0.75 };
+                ctx.set_paint(color(opts.ink(*s), 1.0));
+                ctx.set_stroke(kurbo::Stroke::new(w as f64));
+                ctx.stroke_path(&path);
+            }
+        }
+        Draw::Art { path, fx, color: c, alpha } => {
+            let Some(b) = wordcraft_layout::wordart::path_box(path) else { return };
+            if !b.inflate(200.0, 200.0).overlaps(*visible) {
+                return;
+            }
+            ctx.set_transform(view);
+            for l in wordcraft_layout::wordart::art_layers(path, fx, *c, *alpha) {
+                match &l.paint {
+                    ArtPaint::Solid(c, a) => ctx.set_paint(color(opts.ink(*c), *a)),
+                    ArtPaint::Linear { p0, p1, stops } => {
+                        let stops: Vec<peniko::ColorStop> =
+                            stops.iter().map(|(o, c, a)| peniko::ColorStop::from((o.clamp(0.0, 1.0), color(opts.ink(*c), *a)))).collect();
+                        let g = peniko::Gradient::new_linear((f64::from(p0.0), f64::from(p0.1)), (f64::from(p1.0), f64::from(p1.1)))
+                            .with_stops(stops.as_slice());
+                        ctx.set_paint(g);
+                    }
+                }
+                match l.stroke {
+                    Some(w) => {
+                        ctx.set_stroke(kurbo::Stroke::new(f64::from(w.clamp(0.1, 400.0))).with_join(kurbo::Join::Round));
+                        ctx.stroke_path(&l.path);
+                    }
+                    None => ctx.fill_path(&l.path),
+                }
+            }
+        }
+        Draw::Ink { pts, color: c, width, alpha } => {
+            let Some(path) = ink_path(pts) else { return };
+            if !path.bounding_box().inflate(*width as f64, *width as f64).overlaps(*visible) {
+                return;
+            }
+            ctx.set_transform(view);
+            ctx.set_paint(color(opts.ink(*c), *alpha));
+            let w = if width.is_finite() { width.clamp(0.25, 200.0) } else { 1.0 };
+            ctx.set_stroke(kurbo::Stroke::new(w as f64).with_caps(kurbo::Cap::Round).with_join(kurbo::Join::Round));
+            ctx.stroke_path(&path);
+        }
+        Draw::Shape { rect, kind, fill, stroke, stroke_width, effects } => {
             let r = kurbo::Rect::new(rect.x as f64, rect.y as f64, rect.right() as f64, rect.bottom() as f64);
             let path = shape_path(*kind, r);
             ctx.set_transform(view);
+            let fx = effects.sanitized();
+            let can_fill = *kind != ShapeKind::Line && fill.is_some();
+            if !fx.is_empty() && (can_fill || stroke.is_some()) {
+                let sw = if stroke_width.is_finite() { stroke_width.clamp(0.25, 200.0) as f64 } else { 0.75 };
+                // The shape's silhouette grown by `g` points and moved by `d`, in the current paint.
+                let silhouette = |ctx: &mut RenderContext, g: f32, d: kurbo::Vec2| {
+                    let g = g as f64;
+                    if can_fill {
+                        let grow = g + if stroke.is_some() { sw / 2.0 } else { 0.0 };
+                        let rr = r.inflate(grow, grow) + d;
+                        if rr.width() > 0.0 && rr.height() > 0.0 {
+                            ctx.fill_path(&shape_path(*kind, rr));
+                        }
+                    } else if sw + 2.0 * g > 0.05 {
+                        ctx.set_stroke(kurbo::Stroke::new(sw + 2.0 * g));
+                        ctx.stroke_path(&shape_path(*kind, r + d));
+                    }
+                };
+                if let Some(sh) = fx.shadow {
+                    let (dx, dy) = sh.offset();
+                    for (g, a) in wordcraft_doc::effects::bands(-sh.blur / 2.0, sh.blur / 2.0, sh.opacity()) {
+                        ctx.set_paint(color(opts.ink(sh.color), a));
+                        silhouette(ctx, g, kurbo::Vec2::new(dx as f64, dy as f64));
+                    }
+                }
+                if let Some(gl) = fx.glow {
+                    for (g, a) in wordcraft_doc::effects::bands(0.0, gl.size, gl.opacity()) {
+                        ctx.set_paint(color(opts.ink(gl.color), a));
+                        silhouette(ctx, g, kurbo::Vec2::ZERO);
+                    }
+                }
+            }
+            // Soft edges: the fill fades out toward the outline (which fades with it).
+            if let (Some(rad), Some(f), true) = (fx.soft_edge, fill, can_fill) {
+                let rad = rad.min(rect.w.min(rect.h) / 2.0).max(0.0);
+                for (g, a) in wordcraft_doc::effects::bands(-rad, 0.0, 1.0) {
+                    let rr = r.inflate(g as f64, g as f64);
+                    if rr.width() > 0.0 && rr.height() > 0.0 {
+                        ctx.set_paint(color(opts.ink(*f), a));
+                        ctx.fill_path(&shape_path(*kind, rr));
+                    }
+                }
+                return;
+            }
             if let Some(f) = fill {
                 ctx.set_paint(color(opts.ink(*f), 1.0));
                 ctx.fill_path(&path);
@@ -483,7 +837,56 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 ctx.stroke_path(&path);
             }
         }
+        Draw::Clip { rect, items } => {
+            let r = kurbo::Rect::new(rect.x as f64, rect.y as f64, rect.right() as f64, rect.bottom() as f64);
+            if !r.is_finite() || !r.overlaps(*visible) {
+                return;
+            }
+            ctx.set_transform(view);
+            ctx.push_clip_layer(&r.to_path(0.1));
+            let local = r.intersect(*visible);
+            for it in items {
+                draw(ctx, doc, it, view, &local, opts);
+            }
+            ctx.pop_layer();
+        }
+        Draw::Turned { x, y, turn, items } => {
+            let m = Affine::new(Draw::turn_matrix(*turn, *x, *y).map(f64::from));
+            let local = m.inverse().transform_rect_bbox(*visible);
+            for it in items {
+                draw(ctx, doc, it, view * m, &local, opts);
+            }
+        }
+        Draw::Rotated { cx, cy, spin, items } => {
+            let m = Affine::new(spin.matrix(*cx, *cy).map(f64::from));
+            let local = m.inverse().transform_rect_bbox(*visible);
+            for it in items {
+                draw(ctx, doc, it, view * m, &local, opts);
+            }
+        }
     }
+}
+
+/// The line through an ink stroke's points (finite ones only); a single point is a dot.
+fn ink_path(pts: &[(f32, f32)]) -> Option<BezPath> {
+    let mut p = BezPath::new();
+    let mut last = None;
+    for &(x, y) in pts.iter().filter(|(x, y)| x.is_finite() && y.is_finite() && x.abs() < 1e6 && y.abs() < 1e6) {
+        let pt = (x as f64, y as f64);
+        if last.is_none() {
+            p.move_to(pt);
+        } else {
+            p.line_to(pt);
+        }
+        last = Some(pt);
+    }
+    // Only sanitized points reach the path: a tap is drawn at the one usable point.
+    let only = last?;
+    if p.elements().len() == 1 {
+        // A tap: a zero-length line, which round caps draw as a dot.
+        p.line_to(only);
+    }
+    Some(p)
 }
 
 /// Outline of a basic shape in a rectangle.
@@ -502,15 +905,24 @@ pub fn shape_path(kind: ShapeKind, r: kurbo::Rect) -> BezPath {
         p
     };
     match kind {
-        ShapeKind::Rectangle | ShapeKind::TextBox => r.to_path(0.1),
+        // A freeform is drawn from its own paths; without them, its frame.
+        ShapeKind::Rectangle | ShapeKind::TextBox | ShapeKind::Freeform => r.to_path(0.1),
         ShapeKind::RoundedRectangle => kurbo::RoundedRect::from_rect(r, r.width().min(r.height()) * 0.16).to_path(0.1),
         ShapeKind::Ellipse => kurbo::Ellipse::from_rect(r).to_path(0.1),
         ShapeKind::Triangle => poly(&[(cx, r.y0), (r.x1, r.y1), (r.x0, r.y1)]),
         ShapeKind::Diamond => poly(&[(cx, r.y0), (r.x1, cy), (cx, r.y1), (r.x0, cy)]),
+        // DrawingML's `line`: top-left to bottom-right (flips give the other directions).
         ShapeKind::Line => {
             let mut p = BezPath::new();
-            p.move_to((r.x0, r.y1));
-            p.line_to((r.x1, r.y0));
+            p.move_to((r.x0, r.y0));
+            p.line_to((r.x1, r.y1));
+            p
+        }
+        // Connectors are drawn as paths (`Draw::Path`); this is their frame's diagonal.
+        ShapeKind::StraightConnector | ShapeKind::ElbowConnector | ShapeKind::CurvedConnector => {
+            let mut p = BezPath::new();
+            p.move_to((r.x0, r.y0));
+            p.line_to((r.x1, r.y1));
             p
         }
         ShapeKind::Arrow => {
@@ -563,28 +975,6 @@ mod tests {
     use wordcraft_layout::{LayoutCache, LayoutOptions, layout};
 
     #[test]
-    fn decoded_pictures_stay_within_their_budget_least_recently_used_first() {
-        let pm = |w: u16| Some(Arc::new(Pixmap::new(w, 10)));
-        let key = |n: &str| (n.to_string(), 0usize);
-        // Each 10×10 picture is 400 bytes; the budget holds two.
-        let mut c = ImageCache { budget: 900, ..Default::default() };
-        c.insert(key("a"), pm(10));
-        c.insert(key("b"), pm(10));
-        assert!(c.get(&key("a")).is_some(), "a was used last");
-        c.insert(key("c"), pm(10));
-        assert!(c.get(&key("b")).is_none(), "b, the least recently used, went");
-        assert!(c.get(&key("a")).is_some() && c.get(&key("c")).is_some());
-        assert_eq!((c.map.len(), c.bytes), (2, 800));
-        // One picture larger than the budget is still kept (alone), so it draws.
-        c.insert(key("huge"), pm(100));
-        assert_eq!((c.map.len(), c.bytes), (1, 4000));
-        // Replacing an entry doesn't count it twice; failed decodes cost nothing.
-        c.insert(key("huge"), pm(10));
-        c.insert(key("bad"), None);
-        assert_eq!(c.bytes, 400);
-    }
-
-    #[test]
     fn renders_text_dark_pixels() {
         let d = Document::from_text("Hello WordCraft");
         let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
@@ -595,6 +985,85 @@ mod tests {
         assert!(dark > 30, "dark {dark}");
         assert_eq!(img.pixel(5, 5), [255, 255, 255, 255]);
         assert!(!img.to_png().is_empty());
+    }
+
+    /// Table Layout › Text Direction (#226): a turned cell's text is painted running down the
+    /// cell, not across it.
+    #[test]
+    fn turned_cell_text_is_painted_turned() {
+        use wordcraft_doc::props::TextDirection;
+        let ink = |dir: TextDirection| {
+            let mut d = Document::from_text("before\nafter");
+            let mut t = wordcraft_doc::Table::new(1, 2, 400.0);
+            t.rows[0].cells[0].blocks = vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text("WWWWWWWWWWWW", Default::default()))];
+            t.rows[0].cells[0].props.text_direction = dir;
+            d.insert_block(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(1), wordcraft_doc::Block::Table(t)).unwrap();
+            let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+            let img = render_page(&d, &l.pages[0], 1.0, &RenderOptions::default());
+            // Dark pixels inside the first cell (x 72..272, clear of its borders), well below
+            // the first text line.
+            (80..264).flat_map(|x| (140..190).map(move |y| (x, y))).filter(|(x, y)| img.pixel(*x, *y)[0] < 128).count()
+        };
+        assert_eq!(ink(TextDirection::Horizontal), 0, "horizontal text stays in its line");
+        assert!(ink(TextDirection::Down) > 30, "down");
+        assert!(ink(TextDirection::Up) > 30, "up");
+    }
+
+    /// Shape Effects (#275): an outer shadow paints dark pixels beside the shape on the side it is
+    /// cast to, and none on the other; a glow surrounds it.
+    #[test]
+    fn shape_shadow_is_cast_offset_from_the_shape() {
+        use wordcraft_doc::effects::{Glow, Shadow, ShapeEffects};
+        use wordcraft_doc::para::InlineObject;
+        let draw = |effects: ShapeEffects| {
+            let mut d = Document::from_text("");
+            let shape = InlineObject::Shape {
+                kind: ShapeKind::Rectangle,
+                w: 100.0,
+                h: 60.0,
+                fill: Some(Rgb(0, 0, 255)),
+                stroke: None,
+                stroke_width: 0.0,
+                float: Default::default(),
+                story: None,
+                freeform: None,
+                effects,
+                extra: Default::default(),
+            };
+            let at = wordcraft_doc::Pos { story: wordcraft_doc::StoryRef::Body, path: wordcraft_doc::Path::top(0), off: 0 };
+            d.insert_object(&at, shape, &Default::default()).unwrap();
+            let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+            render_page(&d, &l.pages[0], 1.0, &RenderOptions::default())
+        };
+        let plain = draw(ShapeEffects::default());
+        let blue = |img: &Rendered| {
+            let px: Vec<(u32, u32)> = (0..612)
+                .flat_map(|x| (0..400).map(move |y| (x, y)))
+                .filter(|(x, y)| matches!(img.pixel(*x, *y), [r, _, b, _] if r < 40 && b > 200))
+                .collect();
+            let (x0, x1) = (px.iter().map(|p| p.0).min().unwrap(), px.iter().map(|p| p.0).max().unwrap());
+            let (y0, y1) = (px.iter().map(|p| p.1).min().unwrap(), px.iter().map(|p| p.1).max().unwrap());
+            (x0, y0, x1, y1)
+        };
+        let (x0, y0, x1, y1) = blue(&plain);
+        assert!(x1 - x0 > 90 && y1 - y0 > 50, "{:?}", (x0, y0, x1, y1));
+        // Grey (not white, not blue) pixels in a strip just outside an edge.
+        let grey = |img: &Rendered, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
+            xs.flat_map(|x| ys.clone().map(move |y| (x, y)))
+                .filter(|(x, y)| matches!(img.pixel(*x, *y), [r, g, b, _] if r < 200 && r == g && g == b))
+                .count()
+        };
+        let right = |img: &Rendered| grey(img, x1 + 2..x1 + 6, y0 + 10..y1);
+        let left = |img: &Rendered| grey(img, x0.saturating_sub(6)..x0.saturating_sub(2), y0 + 10..y1);
+        assert_eq!((right(&plain), left(&plain)), (0, 0));
+        let shadow = Shadow { color: Rgb::BLACK, transparency: 30.0, blur: 2.0, distance: 8.0, angle: 0.0, rot_with_shape: false };
+        let img = draw(ShapeEffects { shadow: Some(shadow), ..Default::default() });
+        assert_eq!(blue(&img), (x0, y0, x1, y1), "the shape itself is unchanged");
+        assert!(right(&img) > 100, "shadow to the right: {}", right(&img));
+        assert_eq!(left(&img), 0, "nothing on the left");
+        let img = draw(ShapeEffects { glow: Some(Glow { color: Rgb(255, 0, 0), size: 6.0, transparency: 0.0 }), ..Default::default() });
+        let reddish = |x: u32, y: u32| matches!(img.pixel(x, y), [r, g, _, _] if r > 200 && g < 200);
+        assert!(reddish(x1 + 2, (y0 + y1) / 2) && reddish(x0 - 2, (y0 + y1) / 2), "glow on both sides");
     }
 
     #[test]
@@ -649,7 +1118,15 @@ mod tests {
             .unwrap();
         let media = d.add_media(png, "png");
         let mut hp = wordcraft_doc::Paragraph::new();
-        let obj = wordcraft_doc::para::InlineObject::Image { media, w: 40.0, h: 40.0, alt: String::new(), float: Default::default(), crop: [0.0; 4] };
+        let obj = wordcraft_doc::para::InlineObject::Image {
+            media,
+            w: 40.0,
+            h: 40.0,
+            alt: String::new(),
+            float: Default::default(),
+            crop: [0.0; 4],
+            ole: None,
+        };
         hp.insert_object(0, obj, &Default::default()).unwrap();
         let id = d.add_part(wordcraft_doc::PartKind::Header, vec![wordcraft_doc::para_block(hp)]);
         d.last_section.headers.default = Some(id);
@@ -678,6 +1155,134 @@ mod tests {
         assert!(light > 30, "light {light}");
     }
 
+    /// One EMF record: type, size, payload (a multiple of 4 bytes).
+    fn emf_rec(typ: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = typ.to_le_bytes().to_vec();
+        v.extend(((8 + payload.len()) as u32).to_le_bytes());
+        v.extend(payload);
+        v
+    }
+
+    fn le32(vals: &[i32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// A 25 mm square EMF (device units 0.04 per 0.01 mm, so 100 device units) with a red rectangle over
+    /// its right half.
+    fn red_right_half_emf() -> Vec<u8> {
+        let mut h = vec![0u8; 88];
+        h[0..4].copy_from_slice(&1u32.to_le_bytes());
+        h[4..8].copy_from_slice(&88u32.to_le_bytes());
+        h[8..24].copy_from_slice(&le32(&[0, 0, 100, 100]));
+        h[24..40].copy_from_slice(&le32(&[0, 0, 2500, 2500]));
+        h[40..44].copy_from_slice(&0x464D_4520u32.to_le_bytes());
+        h[72..88].copy_from_slice(&le32(&[1000, 1000, 250, 250]));
+        let brush = emf_rec(39, &le32(&[1, 0, 0x0000_00FF, 0]));
+        let select = emf_rec(37, &le32(&[1]));
+        let rect = emf_rec(43, &le32(&[50, 0, 100, 100]));
+        let eof = emf_rec(14, &[0; 12]);
+        [h, brush, select, rect, eof].concat()
+    }
+
+    #[test]
+    fn metafile_picture_is_drawn_as_vectors() {
+        let mut d = Document::new();
+        let media = d.add_media(red_right_half_emf(), "emf");
+        let mut p = wordcraft_doc::Paragraph::new();
+        let obj = wordcraft_doc::para::InlineObject::Image {
+            media,
+            w: 70.0,
+            h: 70.0,
+            alt: String::new(),
+            float: Default::default(),
+            crop: [0.0; 4],
+            ole: None,
+        };
+        p.insert_object(0, obj, &Default::default()).unwrap();
+        d.body = vec![wordcraft_doc::para_block(p)];
+        let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+        let opts = RenderOptions::default();
+        let rect = page_display(&d, &l.pages[0], &opts.display)
+            .iter()
+            .find_map(|i| match i {
+                Draw::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("a picture on the page");
+        let img = render_page(&d, &l.pages[0], 1.0, &opts);
+        let y = (rect.y + rect.h / 2.0) as u32;
+        let right = img.pixel((rect.x + rect.w * 0.75) as u32, y);
+        let left = img.pixel((rect.x + rect.w * 0.25) as u32, y);
+        assert!(right[0] > 200 && right[1] < 60 && right[2] < 60, "right half should be red: {right:?}");
+        assert!(left[..3].iter().all(|c| *c > 200), "left half should be paper, not the grey box: {left:?}");
+    }
+
+    #[test]
+    fn cosmetic_metafile_pen_is_one_device_pixel_wide() {
+        // MOVETO (0, 50), LINETO (100, 50) with the default cosmetic black pen: a hairline across the middle.
+        let mut emf = red_right_half_emf()[..88].to_vec();
+        emf.extend([emf_rec(27, &le32(&[0, 50])), emf_rec(54, &le32(&[100, 50])), emf_rec(14, &[0; 12])].concat());
+        let mut d = Document::new();
+        let media = d.add_media(emf, "emf");
+        let mut p = wordcraft_doc::Paragraph::new();
+        let obj = wordcraft_doc::para::InlineObject::Image {
+            media,
+            w: 70.0,
+            h: 70.0,
+            alt: String::new(),
+            float: Default::default(),
+            crop: [0.0; 4],
+            ole: None,
+        };
+        p.insert_object(0, obj, &Default::default()).unwrap();
+        d.body = vec![wordcraft_doc::para_block(p)];
+        let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+        let opts = RenderOptions::default();
+        let rect = page_display(&d, &l.pages[0], &opts.display)
+            .iter()
+            .find_map(|i| match i {
+                Draw::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("a picture on the page");
+        let scale = 2.0;
+        let img = render_page(&d, &l.pages[0], scale, &opts);
+        let (x, y) = (((rect.x + rect.w / 2.0) * scale) as u32, ((rect.y + rect.h / 2.0) * scale) as u32);
+        let darkest = (y - 3..=y + 3).map(|y| img.pixel(x, y)[0]).min().unwrap_or(255);
+        // A 0.1 pt line would cover a fifth of a pixel (about 204); one device pixel covers at least half of one.
+        assert!(darkest < 140, "the hairline should be clearly visible: {darkest}");
+    }
+
+    #[test]
+    fn unreadable_metafile_keeps_the_grey_box() {
+        let mut d = Document::new();
+        // The header alone has no records, so the metafile does not parse.
+        let media = d.add_media(red_right_half_emf()[..88].to_vec(), "emf");
+        let mut p = wordcraft_doc::Paragraph::new();
+        let obj = wordcraft_doc::para::InlineObject::Image {
+            media,
+            w: 70.0,
+            h: 70.0,
+            alt: String::new(),
+            float: Default::default(),
+            crop: [0.0; 4],
+            ole: None,
+        };
+        p.insert_object(0, obj, &Default::default()).unwrap();
+        d.body = vec![wordcraft_doc::para_block(p)];
+        let l = layout(&d, &mut LayoutCache::new(), &LayoutOptions::default());
+        let opts = RenderOptions::default();
+        let rect = page_display(&d, &l.pages[0], &opts.display)
+            .iter()
+            .find_map(|i| match i {
+                Draw::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("a picture on the page");
+        let img = render_page(&d, &l.pages[0], 1.0, &opts);
+        assert_eq!(img.pixel((rect.x + rect.w / 2.0) as u32, (rect.y + rect.h / 2.0) as u32), [0xD0, 0xD0, 0xD0, 255]);
+    }
+
     #[test]
     fn shapes_have_paths() {
         let r = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0);
@@ -685,4 +1290,15 @@ mod tests {
             assert!(!shape_path(k, r).elements().is_empty());
         }
     }
+
+    /// #611: a line runs as DrawingML's `line` preset does, top-left to bottom-right (Word's
+    /// files flip it for the other diagonal), not bottom-left to top-right.
+    #[test]
+    fn a_line_runs_from_top_left_to_bottom_right() {
+        let p = shape_path(ShapeKind::Line, kurbo::Rect::new(10.0, 20.0, 30.0, 60.0));
+        assert_eq!(p.elements(), &[kurbo::PathEl::MoveTo((10.0, 20.0).into()), kurbo::PathEl::LineTo((30.0, 60.0).into())]);
+    }
 }
+
+#[cfg(test)]
+mod cache_tests;

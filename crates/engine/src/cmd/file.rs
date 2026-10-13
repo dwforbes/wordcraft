@@ -12,7 +12,7 @@ pub const MAX_AUTHOR_CHARS: usize = 255;
 /// Sets the user name that new tracked changes and comments are recorded under. The name is
 /// trimmed, stripped of control characters (they can't go into the saved XML) and cut to
 /// [`MAX_AUTHOR_CHARS`]; a blank name is refused so revisions always carry an author.
-fn set_author(s: &mut Session, v: &Value) -> CmdResult {
+pub(crate) fn set_author(s: &mut Session, v: &Value) -> CmdResult {
     let name: String = p::req_str(v, "name")?.trim().chars().filter(|c| !c.is_control()).take(MAX_AUTHOR_CHARS).collect();
     let name = name.trim_end();
     if name.is_empty() {
@@ -29,40 +29,59 @@ fn set_author(s: &mut Session, v: &Value) -> CmdResult {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("file.new", "New", "File", new).key("Mod+N").params(r#"{"template"?: "blank|sample|letter|resume|report"}"#).pure(),
-        CommandSpec::new("file.open", "Open", "File", open).key("Mod+O").params(r#"{"path": string}"#).pure(),
-        CommandSpec::new("file.save", "Save", "File", save).key("Mod+S").params(r#"{"path"?: string}"#).pure(),
-        CommandSpec::new("file.saveAs", "Save As", "File", save_as).key("F12").params(r#"{"path": string}"#).pure(),
+        CommandSpec::new("file.open", "Open", "File", open)
+            .key("Mod+O / Mod+F12")
+            .params(r#"{"path": string, "data"?: base64 (the file's bytes; `path` then only names it), "password"?: string (for a password-protected Word document)}"#)
+            .pure(),
+        CommandSpec::new("file.save", "Save", "File", save)
+            .key("Mod+S / Shift+F12")
+            .params(r#"{"path"?: string, "password"?: string (encrypt this and later saves with it, as file.encrypt does), "markup"?: bool (Print Markup for a PDF, PNG, HTML, Markdown or text copy: comments shown; default file.printMarkup)}"#)
+            .pure(),
+        CommandSpec::new("file.saveAs", "Save As", "File", save_as).key("F12").params(r#"{"path": string, "password"?: string, "markup"?: bool (as file.save)}"#).pure(),
+        // Pure: the password must not land in Repeat or a recorded macro, and it isn't an edit
+        // to undo; it marks the document as changed itself.
+        CommandSpec::new("file.encrypt", "Encrypt with Password", "File › Info › Protect Document", encrypt)
+            .params(r#"{"password": string (Word documents are saved encrypted with it) | null or "" (saved unencrypted)}"#)
+            .pure(),
         CommandSpec::new("file.exportPdf", "Export PDF", "File › Export", |s, v| {
             let path = p::req_str(v, "path")?;
             let path = if path.to_ascii_lowercase().ends_with(".pdf") { path.to_string() } else { format!("{path}.pdf") };
-            crate::io::save_path(std::path::Path::new(&path), &s.doc).map_err(CmdError::Failed)?;
-            Ok(json!({"path": path}))
+            let opts = export_options(s, v);
+            crate::io::save_path_with(std::path::Path::new(&path), &s.doc, None, &opts).map_err(CmdError::Failed)?;
+            Ok(json!({"path": path, "markup": opts.markup}))
         })
-        .params(r#"{"path": string}"#)
+        .params(r#"{"path": string, "markup"?: bool (Print Markup: tracked changes marked up and each page scaled down beside the comments in balloons; default file.printMarkup)}"#)
         .pure(),
         CommandSpec::new("file.exportPng", "Export Page as PNG", "File › Export", export_png)
-            .params(r#"{"path": string, "page"?: n (1-based), "scale"?: px per pt}"#)
+            .params(r#"{"path": string, "page"?: n (1-based), "scale"?: px per pt, "markup"?: bool (the page with its comments in balloons beside it; default file.printMarkup)}"#)
+            .pure(),
+        // A print setting, like Word's: not part of the document, so no undo step.
+        CommandSpec::new("file.printMarkup", "Print Markup", "File › Print", |s, v| {
+            s.prefs.print_markup = p::bool(v, "value").unwrap_or(!s.prefs.print_markup);
+            Ok(json!({"value": s.prefs.print_markup}))
+        })
+        .params(r#"{"value"?: bool (omit to toggle)} — PDFs, prints and copies show comments (balloons beside each page; a list at the end of HTML, Markdown and text) and tracked changes"#)
+        .pure(),
+        CommandSpec::new("file.printPdf", "Print to PDF", "File › Print", crate::print::print_pdf_to_file)
+            .params(
+                r#"{"path": string, "range"?: "all" | "current" | "selection" (the pages the selection touches) | "custom", "pages"?: "1-3,5" (implies custom), "parity"?: "all" | "odd" | "even", "copies"?: 1-999, "collate"?: bool (default true)}"#,
+            )
             .pure(),
         CommandSpec::new("file.print", "Print", "File", |s, _| {
             s.ui_requests.push(json!({"open": "print"}));
             sel_result(s)
         })
-        .key("Mod+P")
+        .key("Mod+P / Mod+Shift+F12 / Mod+F2")
         .pure(),
         CommandSpec::new("file.close", "Close", "File", |s, _| {
             s.ui_requests.push(json!({"close": true}));
             sel_result(s)
         })
-        .key("Mod+W")
+        .key("Mod+W / Mod+F4")
         .pure(),
         CommandSpec::new("file.properties", "Properties", "File › Info", properties)
             .params(r#"{"title"?, "subject"?, "author"?, "keywords"?, "comments"?, "category"?, "custom"?: {name: string | null (removes)}}"#),
         CommandSpec::new("file.info", "Info", "File", info).pure(),
-        CommandSpec::new("file.options", "Options", "File", |s, _| {
-            s.ui_requests.push(json!({"open": "options"}));
-            sel_result(s)
-        })
-        .pure(),
         CommandSpec::new("file.setAuthor", "User Name", "File › Options › General", set_author)
             .params(r#"{"name": string (author of new tracked changes and comments)}"#)
             .pure(),
@@ -100,7 +119,15 @@ fn new(s: &mut Session, v: &Value) -> CmdResult {
         "letter" => crate::sample::letter(),
         "resume" => crate::sample::resume(),
         "report" => crate::sample::report(),
-        _ => Document::new(),
+        // The Normal template: the region's paper (#838), written in the editing language (the
+        // templates' text is English).
+        _ => {
+            let mut d = s.blank_document();
+            if let Some(lang) = &s.editing_lang {
+                d.styles.default_chr.lang = Some(lang.clone());
+            }
+            d
+        }
     };
     s.set_document(doc);
     s.path = None;
@@ -112,15 +139,46 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
         s.ui_requests.push(json!({"open": "openFile"}));
         return sel_result(s);
     };
-    let doc = if let Some(data) = p::str(v, "data") {
+    let password = p::str(v, "password");
+    let (mut doc, encrypted) = if let Some(data) = p::str(v, "data") {
         let bytes = super::insert::base64_decode(data).ok_or_else(|| CmdError::Params("bad base64".into()))?;
-        crate::io::open_bytes(path, &bytes).map_err(CmdError::Failed)?
+        crate::io::open_bytes_with(path, &bytes, password).map_err(CmdError::Failed)?
     } else {
-        crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?
+        crate::io::open_path_with(std::path::Path::new(path), password).map_err(CmdError::Failed)?
     };
+    // Plain text and Markdown carry no language: they are in the editing language.
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if let Some(lang) = &s.editing_lang
+        && matches!(ext.as_str(), "txt" | "text" | "md" | "markdown")
+    {
+        doc.styles.default_chr.lang = Some(lang.clone());
+    }
     s.set_document(doc);
     s.path = Some(path.into());
-    Ok(json!({"path": path, "paragraphs": s.doc.paragraph_count(), "words": s.doc.word_count()}))
+    // Like Word, a document opened with a password is saved with it again.
+    if encrypted {
+        s.password = password.map(crate::io::Password::new);
+    }
+    Ok(json!({"path": path, "paragraphs": s.doc.paragraph_count(), "words": s.doc.word_count(), "encrypted": encrypted}))
+}
+
+/// File › Info › Protect Document › Encrypt with Password: the password Word documents are saved
+/// with from now on, or none.
+fn encrypt(s: &mut Session, v: &Value) -> CmdResult {
+    let password = match v.get("password") {
+        Some(Value::Null) => None,
+        Some(Value::String(pw)) if pw.is_empty() => None,
+        Some(Value::String(pw)) => {
+            wordcraft_docx::check_password(pw).map_err(|e| CmdError::Params(e.to_string()))?;
+            Some(crate::io::Password::new(pw))
+        }
+        _ => return Err(CmdError::Params("`password` must be a string, or null to remove the password".into())),
+    };
+    if password != s.password {
+        s.password = password;
+        s.dirty = true;
+    }
+    Ok(json!({"encrypted": s.password.is_some()}))
 }
 
 fn save(s: &mut Session, v: &Value) -> CmdResult {
@@ -131,19 +189,26 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
             return Ok(json!({"saved": false}));
         }
     };
-    s.doc.core.modified = super::now_iso();
-    if s.doc.core.created.is_empty() {
-        s.doc.core.created = s.doc.core.modified.clone();
+    if let Some(pw) = v.get("password").filter(|pw| !pw.is_null()) {
+        let Some(pw) = pw.as_str().filter(|pw| !pw.is_empty()) else {
+            return Err(CmdError::Params("`password` must be a non-empty string (file.encrypt removes a password)".into()));
+        };
+        if !crate::io::can_encrypt(&path.to_string_lossy()) {
+            return Err(CmdError::Params("only Word documents (.docx, .docm, .dotx, .dotm) can be saved with a password".into()));
+        }
+        wordcraft_docx::check_password(pw).map_err(|e| CmdError::Params(e.to_string()))?;
+        s.password = Some(crate::io::Password::new(pw));
     }
-    s.doc.core.last_modified_by = s.author.clone();
-    s.doc.core.revision = s.doc.core.revision.saturating_add(1);
-    crate::io::save_path(&path, &s.doc).map_err(CmdError::Failed)?;
+    s.stamp_save();
+    let password = s.password.as_ref().map(crate::io::Password::as_str);
+    crate::io::save_path_with(&path, &s.doc, password, &export_options(s, v)).map_err(CmdError::Failed)?;
+    let encrypted = password.is_some() && crate::io::can_encrypt(&path.to_string_lossy());
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if ["docx", "docm", "dotx", "dotm", "odt", "rtf", "json"].contains(&ext.as_str()) {
+    if ["docx", "docm", "dotx", "dotm", "odt", "rtf", "json", "xml"].contains(&ext.as_str()) {
         s.path = Some(path.clone());
         s.dirty = false;
     }
-    Ok(json!({"saved": true, "path": path.to_string_lossy()}))
+    Ok(json!({"saved": true, "path": path.to_string_lossy(), "encrypted": encrypted}))
 }
 
 fn save_as(s: &mut Session, v: &Value) -> CmdResult {
@@ -154,16 +219,22 @@ fn save_as(s: &mut Session, v: &Value) -> CmdResult {
     save(s, v)
 }
 
+/// How a copy is written: Print Markup from the command's `markup`, else the File › Print
+/// setting (`file.printMarkup`); comments as Track Changes Options show them.
+pub fn export_options(s: &Session, v: &Value) -> crate::io::ExportOptions {
+    let markup = p::bool(v, "markup").unwrap_or(s.prefs.print_markup);
+    crate::io::ExportOptions { markup, comments: markup && s.prefs.markup.comments }
+}
+
 fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     let path = p::req_str(v, "path")?;
     let page = p::u64(v, "page").unwrap_or(1).max(1) as usize - 1;
     let scale = p::f32(v, "scale").unwrap_or(2.0).clamp(0.1, 8.0);
-    let l = s.export_layout();
+    let l = s.export_layout_with(export_options(s, v).markup);
     let pg = l.pages.get(page).ok_or_else(|| CmdError::Params(format!("no page {}", page + 1)))?;
     let img = wordcraft_render::render_page(&s.doc, pg, scale, &Default::default());
     let png = img.to_png();
-    #[cfg(not(target_arch = "wasm32"))]
-    std::fs::write(path, &png).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;
+    crate::io::write_file(path, &png).map_err(CmdError::Failed)?;
     Ok(json!({"path": path, "width": img.width, "height": img.height, "bytes": png.len()}))
 }
 
@@ -221,6 +292,7 @@ fn info(s: &mut Session, _: &Value) -> CmdResult {
         "trackChanges": s.doc.settings.track_changes,
         "comments": s.doc.comments.len(),
         "sections": s.doc.sections().len(),
+        "encrypted": s.password.is_some(),
         "layoutMs": l.ms,
     }))
 }

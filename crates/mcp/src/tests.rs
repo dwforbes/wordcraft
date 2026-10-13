@@ -67,3 +67,55 @@ fn resources() {
     let r = call(&mut s, 2, "resources/read", json!({"uri": "wordcraft://document"}));
     assert!(r["result"]["contents"][0]["text"].as_str().unwrap().contains("blocks"));
 }
+
+/// A backend standing in for a running app: it answers `ui.render` and `ui.screenshot` with a
+/// PNG in the reply and records what it was asked.
+struct FakeApp {
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+impl crate::backend::Backend for FakeApp {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.calls.lock().unwrap().push((method.to_string(), params.clone()));
+        match method {
+            "ui.render" | "ui.screenshot" => Ok(json!({"png": wordcraft_engine::cmd::insert::base64_encode(b"\x89PNG"), "width": 1, "height": 1})),
+            other => Err(format!("unexpected {other}")),
+        }
+    }
+    fn has_ui(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> String {
+        "fake app".into()
+    }
+}
+
+/// With an app attached, pictures travel inside the reply: the bridge never writes a file with a
+/// predictable name into the shared temporary folder (another user could plant a link there).
+#[test]
+fn render_and_screenshot_through_the_app_use_no_temp_file() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Server::new(Box::new(FakeApp { calls: calls.clone() }));
+    for (tool, method) in [("render_page", "ui.render"), ("screenshot", "ui.screenshot")] {
+        let r = call(&mut s, 10, "tools/call", json!({"name": tool, "arguments": {"page": 1}}));
+        let content = &r["result"]["content"];
+        assert_eq!(r["result"]["isError"], false, "{tool}: {r}");
+        assert_eq!(content[0]["type"], "image", "{tool}");
+        assert_eq!(content[0]["data"], wordcraft_engine::cmd::insert::base64_encode(b"\x89PNG"), "{tool}");
+        let (m, params) = calls.lock().unwrap().pop().expect("one call");
+        assert_eq!(m, method);
+        assert!(params.get("path").is_none(), "{tool} asked for a file: {params}");
+    }
+}
+
+/// #40: a headless session never reads or writes the person's custom dictionary file: an agent's
+/// Add to Dictionary stays in memory (only the desktop app saves the dictionary).
+#[test]
+fn headless_sessions_keep_the_dictionary_in_memory() {
+    let mut h = Headless::default();
+    assert!(h.session.user_dict_path.is_none());
+    let mut s = Server::new(Box::new(Headless::default()));
+    tool(&mut s, "execute", json!({"command": "review.addToDictionary", "params": {"word": "zxqmcpword"}}));
+    h.session.run("review.addToDictionary", &json!({"word": "zxqmcpword2"})).expect("added");
+    assert!(h.session.user_dict_path.is_none());
+}

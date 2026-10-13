@@ -496,6 +496,15 @@ fn worker(shared: &(Mutex<Shared>, Condvar), backend: Backend) {
     }
 }
 
+/// Windows PowerShell by its full path, `<SystemRoot>\System32\WindowsPowerShell\v1.0\powershell.exe`
+/// (`C:\Windows` when `SystemRoot` is unset), rather than whichever `powershell` the program search
+/// finds first.
+#[cfg(any(target_os = "windows", test))]
+fn windows_powershell(system_root: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let root = system_root.filter(|r| !r.is_empty()).unwrap_or_else(|| "C:\\Windows".into());
+    std::path::Path::new(&root).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe")
+}
+
 /// Speak one sentence with the system's speech program, stopping early when `changed()`.
 #[cfg(not(target_arch = "wasm32"))]
 fn speak(text: &str, rate: f32, changed: &dyn Fn() -> bool) -> Spoken {
@@ -517,7 +526,7 @@ fn speak(text: &str, rate: f32, changed: &dyn Fn() -> bool) -> Spoken {
         let script = format!(
             "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = {r}; $s.Speak([Console]::In.ReadToEnd())"
         );
-        let mut c = Command::new("powershell");
+        let mut c = Command::new(windows_powershell(std::env::var_os("SystemRoot")));
         c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
         tries.push(c);
     }
@@ -569,6 +578,18 @@ mod tests {
 
     fn texts(v: &[Utterance]) -> Vec<&str> {
         v.iter().map(|u| u.text.as_str()).collect()
+    }
+
+    #[test]
+    fn powershell_is_launched_from_the_system_folder() {
+        let tail = std::path::Path::new("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        let p = windows_powershell(Some("D:\\Win".into()));
+        assert!(p.starts_with("D:\\Win") && p.ends_with(&tail), "{}", p.display());
+        // No SystemRoot, or an empty one: the default Windows folder.
+        for root in [None, Some("".into())] {
+            let p = windows_powershell(root);
+            assert!(p.starts_with("C:\\Windows") && p.ends_with(&tail), "{}", p.display());
+        }
     }
 
     #[test]

@@ -7,6 +7,8 @@ use proptest::prelude::*;
 
 use super::read;
 
+mod drawing;
+
 /// Offset in the WordDocument stream where test text pieces are placed (past the FIB).
 const TEXT_FC: u32 = 0x600;
 /// Offset in the Table stream where the test Clx is placed.
@@ -363,18 +365,24 @@ fn grpprl(prls: &[(u16, &[u8])]) -> Vec<u8> {
     v
 }
 
-/// One STD record (Word 97 shape, cbSTDBaseInFile = 10).
+/// One STD record (Word 97 shape, cbSTDBaseInFile = 10) with no next-paragraph style.
+/// `istd_base` is zero-based; 0x0FFF means no parent.
 fn std_bytes(stk: u8, istd_base: u16, name: &str, papx: &[u8], chpx: &[u8]) -> Vec<u8> {
+    std_bytes_next(stk, istd_base, 0x0FFF, name, papx, chpx)
+}
+
+/// One STD record with an explicit next-paragraph style ([MS-DOC] §2.9.260 StdfBase).
+fn std_bytes_next(stk: u8, istd_base: u16, istd_next: u16, name: &str, papx: &[u8], chpx: &[u8]) -> Vec<u8> {
     let cupx = if stk == 1 { 2 } else { 1 };
     let mut base = vec![0u8; 10];
     // sti 0xFFF (user-defined) | flags
     base[0] = 0xFF;
     base[1] = 0x0F;
-    // stk(4) | istdNext(12) = none (0xFFF)
-    base[2] = stk | 0xF0;
-    base[3] = 0xFF;
-    // cupx(4) | istdBase(12)
-    let w2 = (cupx as u16) | (istd_base << 4);
+    // stk(4) | istdBase(12)
+    let w1 = (stk as u16) | (istd_base << 4);
+    base[2..4].copy_from_slice(&w1.to_le_bytes());
+    // cupx(4) | istdNext(12)
+    let w2 = (cupx as u16) | (istd_next << 4);
     base[4..6].copy_from_slice(&w2.to_le_bytes());
     // bchUpe filled below; grfstd = 0
     let mut v = base;
@@ -422,14 +430,29 @@ fn stsh_bytes(styles: &[Vec<u8>]) -> Vec<u8> {
 
 /// A non-extended SttbfFfn of font names.
 fn ffn_bytes(names: &[&str]) -> Vec<u8> {
-    let mut v = (names.len() as u16).to_le_bytes().to_vec();
+    let fonts: Vec<(&str, Option<&str>)> = names.iter().map(|n| (*n, None)).collect();
+    ffn_bytes_alt(&fonts)
+}
+
+/// A non-extended SttbfFfn ([MS-DOC] §2.9.286): cData, cbExtra = 0, then per font a one-byte
+/// cchData and an FFN (39-byte header, NUL-terminated UTF-16 name, optional alternate name
+/// whose offset in characters is `ixchSzAlt`).
+fn ffn_bytes_alt(fonts: &[(&str, Option<&str>)]) -> Vec<u8> {
+    let utf16z = |s: &str| -> Vec<u8> { s.chars().chain(['\0']).flat_map(|c| (c as u16).to_le_bytes()).collect() };
+    let mut v = (fonts.len() as u16).to_le_bytes().to_vec();
     v.extend_from_slice(&0u16.to_le_bytes()); // cbExtra
-    for n in names {
-        v.extend_from_slice(&[0u8; 40]); // FFN header
-        for c in n.chars() {
-            v.extend_from_slice(&(c as u16).to_le_bytes());
+    for (name, alt) in fonts {
+        let mut ffn = vec![0u8; 39];
+        let primary = utf16z(name);
+        if alt.is_some() {
+            ffn[4] = (primary.len() / 2) as u8; // ixchSzAlt
         }
-        v.extend_from_slice(&0u16.to_le_bytes()); // NUL
+        ffn.extend_from_slice(&primary);
+        if let Some(a) = alt {
+            ffn.extend_from_slice(&utf16z(a));
+        }
+        v.push(ffn.len() as u8); // cchData
+        v.extend_from_slice(&ffn);
     }
     v
 }
@@ -499,12 +522,34 @@ struct RichSpec {
     papx_entries: Vec<(u32, u16, Vec<u8>)>,
 }
 
+/// Optional extras of a [`rich_doc`]: Prcs and the piece's Prm, alternate font names
+/// (parallel to `RichSpec::fonts`) and next-paragraph styles (parallel to `RichSpec::styles`).
+#[derive(Default)]
+struct RichExtra {
+    prcs: Vec<Vec<u8>>,
+    prm: u16,
+    alt_fonts: Vec<Option<&'static str>>,
+    style_next: Vec<u16>,
+}
+
 fn rich_doc(spec: &RichSpec) -> Vec<u8> {
+    rich_doc_with(spec, &RichExtra::default())
+}
+
+fn rich_doc_with(spec: &RichSpec, extra: &RichExtra) -> Vec<u8> {
     let text: String = spec.text.into();
     let ccp = text.chars().count() as u32;
-    let _ = &text;
-    let plc = plcpcd(&[Piece { compressed: false, text: text.clone() }], TEXT_FC);
-    let mut clx = vec![0x02u8];
+    let mut plc = plcpcd(&[Piece { compressed: false, text: text.clone() }], TEXT_FC);
+    // The single Pcd is last: its Prm is the final two bytes.
+    let n = plc.len();
+    plc[n - 2..].copy_from_slice(&extra.prm.to_le_bytes());
+    let mut clx = Vec::new();
+    for g in &extra.prcs {
+        clx.push(0x01u8);
+        clx.extend_from_slice(&(g.len() as u16).to_le_bytes());
+        clx.extend_from_slice(g);
+    }
+    clx.push(0x02u8);
     clx.extend_from_slice(&(plc.len() as u32).to_le_bytes());
     clx.extend_from_slice(&plc);
 
@@ -518,9 +563,15 @@ fn rich_doc(spec: &RichSpec) -> Vec<u8> {
     word.extend_from_slice(&papx_fkp(&spec.papx_entries));
 
     // Table: STSH | FFN | Clx | bin tables.
-    let styles: Vec<Vec<u8>> = spec.styles.iter().map(|s| std_bytes(s.0, s.1, s.2, &s.3, &s.4)).collect();
+    let styles: Vec<Vec<u8>> = spec
+        .styles
+        .iter()
+        .enumerate()
+        .map(|(i, s)| std_bytes_next(s.0, s.1, extra.style_next.get(i).copied().unwrap_or(0x0FFF), s.2, &s.3, &s.4))
+        .collect();
     let stsh = stsh_bytes(&styles);
-    let ffn = ffn_bytes(&spec.fonts);
+    let fonts: Vec<(&str, Option<&str>)> = spec.fonts.iter().enumerate().map(|(i, n)| (*n, extra.alt_fonts.get(i).copied().flatten())).collect();
+    let ffn = ffn_bytes_alt(&fonts);
     let clx_at = 0x40;
     let bins_at = clx_at + clx.len();
     let plcf_chpx =
@@ -564,7 +615,7 @@ fn para0(doc: &wordcraft_doc::Document) -> wordcraft_doc::Paragraph {
 fn character_formatting_applied() {
     let spec = RichSpec {
         text: "plain bold red\r",
-        styles: vec![(1, 0, "Normal", Vec::new(), Vec::new())],
+        styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
         fonts: vec!["Times New Roman", "Arial"],
         chpx_runs: vec![
             (0, Vec::new()),
@@ -588,8 +639,8 @@ fn font_and_size_from_style_and_direct() {
     let spec = RichSpec {
         text: "Hello\r",
         styles: vec![
-            (1, 0, "Normal", Vec::new(), grpprl(&[(0x4A43, &24u16.to_le_bytes())])), // 12pt
-            (2, 0, "Emphasis", Vec::new(), grpprl(&[(0x4A4F, &1u16.to_le_bytes())])), // Arial
+            (1, 0x0FFF, "Normal", Vec::new(), grpprl(&[(0x4A43, &24u16.to_le_bytes())])), // 12pt
+            (2, 0x0FFF, "Emphasis", Vec::new(), grpprl(&[(0x4A4F, &1u16.to_le_bytes())])), // Arial
         ],
         fonts: vec!["Times New Roman", "Arial"],
         chpx_runs: vec![(0, grpprl(&[(0x4A4F, &1u16.to_le_bytes())]))],
@@ -606,7 +657,7 @@ fn paragraph_props_and_heading_style() {
     let spec = RichSpec {
         text: "centered\rplain\r",
         styles: vec![
-            (1, 0, "Normal", Vec::new(), Vec::new()),
+            (1, 0x0FFF, "Normal", Vec::new(), Vec::new()),
             (1, 0, "heading 1", grpprl(&[(0x2461, &[0x01, 0x00])]), Vec::new()), // centered
         ],
         fonts: vec!["Times New Roman"],
@@ -622,6 +673,34 @@ fn paragraph_props_and_heading_style() {
     let p1 = doc.body.get(1).and_then(|b| b.as_para()).expect("para");
     assert_eq!(p1.props.indent_left, Some(36.0)); // 720 twips = 36pt
     assert_eq!(p1.props.style.as_deref(), Some("Normal"));
+}
+
+/// #534: Chinese theses set a first-line indent of two characters (`sprmPDxaLeft1`, whose operand
+/// is two bytes, plus `sprmPDxcLeft1` in hundredths of a character), and exact line spacing as a
+/// negative LSPD `dyaLine`. Both were lost: the indent read as four bytes, and exact 20pt as
+/// 799pt, a page per empty paragraph.
+#[test]
+fn first_line_indent_chars_and_exact_line_spacing() {
+    let lspd = |dya: i16, mult: u16| [dya.to_le_bytes(), mult.to_le_bytes()].concat();
+    let (exact, multiple) = (lspd(-400, 0), lspd(360, 1));
+    let spec = RichSpec {
+        text: "indented\rexact\rold\r",
+        styles: vec![(1, 0, "Normal", Vec::new(), Vec::new())],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![
+            (0, 0, grpprl(&[(0x8460, &480i16.to_le_bytes()), (0x4457, &200i16.to_le_bytes()), (0x6412, &multiple)])),
+            (9, 0, grpprl(&[(0x6412, &exact)])),
+            (15, 0, grpprl(&[(0x8411, &(-360i16).to_le_bytes())])),
+        ],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let para = |i: usize| doc.body.get(i).and_then(|b| b.as_para()).expect("para").props.clone();
+    let p0 = para(0);
+    assert_eq!((p0.indent_first, p0.indent_first_chars), (Some(24.0), Some(2.0)));
+    assert_eq!(p0.line_spacing, Some(wordcraft_doc::props::LineSpacing::Multiple(1.5)));
+    assert_eq!(para(1).line_spacing, Some(wordcraft_doc::props::LineSpacing::Exactly(20.0)));
+    assert_eq!(para(2).indent_first, Some(-18.0)); // sprmPDxaLeft1_80: a hanging indent
 }
 
 /// Local corpus (gitignored `plan/word/fixtures`): real files must open with text and styles.
@@ -772,7 +851,7 @@ fn struct_doc(spec: &StructSpec) -> Vec<u8> {
     table.extend_from_slice(&plcf_sed);
     let hdd_plc_at = table.len();
     table.extend_from_slice(&plcf_hdd);
-    let stsh = stsh_bytes(&[std_bytes(1, 0, "Normal", &Vec::new(), &Vec::new())]);
+    let stsh = stsh_bytes(&[std_bytes(1, 0x0FFF, "Normal", &Vec::new(), &Vec::new())]);
     let stsh_at = table.len();
     table.extend_from_slice(&stsh);
     let ffn = ffn_bytes(&["Times New Roman"]);
@@ -1551,7 +1630,7 @@ fn picture_bytes_are_capped_per_document() {
     pics.limit = 1000;
     let first = pics.get(&data, 0).expect("first fits");
     // Same location again: no new bytes.
-    assert_eq!(pics.get(&data, 0).map(|p| p.0), Some(first.0.clone()));
+    assert_eq!(pics.get(&data, 0).map(|p| p.key), Some(first.key.clone()));
     // A second distinct picture would exceed the cap.
     assert!(pics.get(&data, a.len() as u32).is_none());
     assert_eq!(pics.media.len(), 1);
@@ -1575,4 +1654,255 @@ fn list_and_lfo_offsets_near_u32_max_are_safe() {
     let f = raw_piece_doc_with(&[0, 2], &[fc], b"a\r", 2, &[(73, far, 2), (74, far, 4)]);
     let doc = read(&f).expect("opens");
     assert!(doc.numbering.nums.is_empty());
+}
+
+/// A StructSpec with one section (`sepx`) over `text`, no lists, notes or extras.
+fn one_section(text: &'static str, sepx: Vec<u8>, papx_entries: Vec<(u32, u16, Vec<u8>)>) -> StructSpec {
+    StructSpec {
+        text,
+        header_stories: vec![],
+        sections: vec![(text.chars().count() as u32, sepx)],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries,
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    }
+}
+
+#[test]
+fn piece_prm_character_formatting_applied() {
+    // #458. Bit 0 of a Prm is fComplex ([MS-DOC] §2.9.215/§2.9.216): Prm0 = isprm in bits
+    // 1-7 plus a one-byte operand in bits 8-15 (isprm 0x55 is sprmCFBold); Prm1 = a
+    // zero-based Prc index in bits 1-15. Piece properties apply after the CHPX.
+    let bold = grpprl(&[(0x0835, &[0x01])]);
+    let prcs = vec![bold.clone(), [grpprl(&[(0x0836, &[0x01])]), bold.clone()].concat()];
+    let run = |prm: u16, chpx: Vec<u8>| {
+        let spec = RichSpec {
+            text: "Bold\r",
+            styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+            fonts: vec!["Times New Roman"],
+            chpx_runs: vec![(0, chpx)],
+            papx_entries: vec![(0, 0, Vec::new())],
+        };
+        let doc = read(&rich_doc_with(&spec, &RichExtra { prcs: prcs.clone(), prm, ..Default::default() })).expect("opens");
+        let p = para0(&doc);
+        assert_eq!(p.text, "Bold");
+        p.runs.first().map(|r| (r.props.bold, r.props.italic)).unwrap_or_default()
+    };
+    assert_eq!(run(0x01AA, Vec::new()), (Some(true), None), "Prm0 bold on");
+    assert_eq!(run(0x0001, Vec::new()), (Some(true), None), "Prm1 → Prc 0 (bold)");
+    assert_eq!(run(0x0003, Vec::new()), (Some(true), Some(true)), "Prm1 → Prc 1 (italic + bold)");
+    assert_eq!(run(0x00AA, bold.clone()).0, Some(false), "Prm0 bold off overrides the CHPX");
+    assert_eq!(run(0x0000, Vec::new()), (None, None), "no Prm: plain");
+    assert_eq!(run(0x0000, bold).0, Some(true), "CHPX bold alone");
+}
+
+#[test]
+fn section_break_kinds_imported() {
+    // #459. SBkcOperand: 0 continuous, 1 new column, 2 new page, 3 even page, 4 odd page.
+    use wordcraft_doc::section::SectionStart;
+    let kinds = [SectionStart::Continuous, SectionStart::NextColumn, SectionStart::NextPage, SectionStart::EvenPage, SectionStart::OddPage];
+    for (bkc, want) in kinds.into_iter().enumerate() {
+        let spec = one_section("Text\r", grpprl(&[(0x3009, &[bkc as u8])]), vec![(0, 0, Vec::new())]);
+        let doc = read(&struct_doc(&spec)).expect("opens");
+        assert_eq!(doc.last_section.start, want, "sprmSBkc {bkc}");
+    }
+}
+
+#[test]
+fn explicit_section_orientation_imported() {
+    // #460. SBOrientationOperand ([MS-DOC] §2.9.236): 1 portrait, 2 landscape.
+    let page = |w: u16, h: u16, orient: Option<u8>| {
+        let mut prls: Vec<(u16, &[u8])> = Vec::new();
+        let (w, h) = (w.to_le_bytes(), h.to_le_bytes());
+        let o = orient.map(|o| [o]);
+        if let Some(o) = &o {
+            prls.push((0x301D, o));
+        }
+        prls.push((0xB01F, &w));
+        prls.push((0xB020, &h));
+        let doc = read(&struct_doc(&one_section("Text\r", grpprl(&prls), vec![(0, 0, Vec::new())]))).expect("opens");
+        (doc.last_section.landscape, doc.last_section.page_w, doc.last_section.page_h)
+    };
+    assert_eq!(page(12240, 15840, Some(1)), (false, 612.0, 792.0), "explicit portrait");
+    assert_eq!(page(15840, 12240, Some(2)), (true, 792.0, 612.0), "explicit landscape");
+    assert_eq!(page(12240, 15840, None), (false, 612.0, 792.0), "inferred portrait");
+    assert_eq!(page(15840, 12240, None), (true, 792.0, 612.0), "inferred landscape");
+}
+
+#[test]
+fn negative_list_reference_keeps_list_membership() {
+    // #461. sprmPIlfo 0xF802-0xFFFF is the negation of a 1-based LFO index whose paragraph
+    // keeps its own indents ([MS-DOC] §2.6.2); 0 and 0xF801 mean "not in a list".
+    let levels: Vec<Vec<u8>> = (0..9).map(|_| lvl(1, 0x00, &[0x0000, 0x002E], true)).collect();
+    let listed = |ilfo: u16| [grpprl(&[(0x260A, &[0x00]), (0x840F, &720u16.to_le_bytes())]), grpprl(&[(0x460B, &ilfo.to_le_bytes())])].concat();
+    let text = "pos\rneg\rzero\rnone\r";
+    let mut spec = one_section(text, Vec::new(), vec![(0, 0, listed(0x0001)), (4, 0, listed(0xFFFF)), (8, 0, listed(0)), (13, 0, listed(0xF801))]);
+    spec.plf_lst = plf_lst(0x1000, true, &levels[..1]);
+    spec.plf_lfo = plf_lfo(0x1000);
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let para = |i: usize| doc.body.get(i).and_then(|b| b.as_para()).map(|p| (p.props.numbering, p.props.indent_left)).unwrap_or_default();
+    let one = Some(wordcraft_doc::props::NumRef { num: 1, level: 0 });
+    assert_eq!(para(0), (one, Some(36.0)), "0x0001");
+    assert_eq!(para(1), (one, Some(36.0)), "0xFFFF = -1");
+    assert_eq!(para(2).0, None, "0");
+    assert_eq!(para(3).0, None, "0xF801");
+}
+
+#[test]
+fn style_inherits_its_declared_base() {
+    // #462. StdfBase ([MS-DOC] §2.9.260): stk + istdBase share the second word, cupx +
+    // istdNext the third; istdBase is zero-based. The next style must not affect the base.
+    for next in [0u16, 1, 2, 0x0FFF] {
+        let spec = RichSpec {
+            text: "Text\r",
+            styles: vec![
+                (1, 0x0FFF, "Normal", Vec::new(), grpprl(&[(0x0835, &[0x01])])), // bold
+                (1, 0, "Derived", Vec::new(), Vec::new()),
+                (1, 1, "Grandchild", Vec::new(), grpprl(&[(0x0836, &[0x01])])), // italic
+                // A corrupt cycle must neither hang nor crash.
+                (1, 4, "Loop A", Vec::new(), Vec::new()),
+                (1, 3, "Loop B", Vec::new(), Vec::new()),
+            ],
+            fonts: vec!["Times New Roman"],
+            chpx_runs: vec![(0, Vec::new())],
+            papx_entries: vec![(0, 1, Vec::new())],
+        };
+        let extra = RichExtra { style_next: vec![0x0FFF, next, 0x0FFF, 0x0FFF, 0x0FFF], ..Default::default() };
+        let doc = read(&rich_doc_with(&spec, &extra)).expect("opens");
+        let style = |name: &str| doc.styles.styles.iter().find(|s| s.name == name).cloned().expect("style");
+        let derived = style("Derived");
+        assert_eq!(derived.based_on.as_deref(), Some("Normal"), "next {next}");
+        assert_eq!(derived.chr.bold, Some(true), "next {next}");
+        let grand = style("Grandchild");
+        assert_eq!(grand.based_on.as_deref(), Some("Derived"));
+        assert_eq!((grand.chr.bold, grand.chr.italic), (Some(true), Some(true)), "two-level chain");
+        assert_eq!(style("Normal").based_on, None);
+        assert_eq!(para0(&doc).props.style.as_deref(), Some("Derived"));
+    }
+}
+
+#[test]
+fn alternate_font_name_keeps_later_entries() {
+    // #463. An STTB entry's length is its cchData ([MS-DOC] §2.2.4), which covers the FFN's
+    // optional alternate name (§2.9.82 xszAlt); the next entry starts after it.
+    for alt in [None, Some("ArialMT")] {
+        let spec = RichSpec {
+            text: "ab\r",
+            styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+            fonts: vec!["Arial", "Courier New"],
+            chpx_runs: vec![(0, grpprl(&[(0x4A4F, &0u16.to_le_bytes())])), (1, grpprl(&[(0x4A4F, &1u16.to_le_bytes())]))],
+            papx_entries: vec![(0, 0, Vec::new())],
+        };
+        let doc = read(&rich_doc_with(&spec, &RichExtra { alt_fonts: vec![alt, None], ..Default::default() })).expect("opens");
+        let fonts: Vec<Option<String>> = para0(&doc).runs.iter().map(|r| r.props.font.clone()).collect();
+        assert_eq!(fonts, [Some("Arial".to_string()), Some("Courier New".to_string())], "alt {alt:?}");
+    }
+}
+
+/// PChgTabsPapxOperand bytes: cb, removed stops, added stops with their TBDs.
+fn tabs_papx(del: &[i16], add: &[(i16, u8)]) -> Vec<u8> {
+    let mut v = vec![0u8, del.len() as u8];
+    for d in del {
+        v.extend_from_slice(&d.to_le_bytes());
+    }
+    v.push(add.len() as u8);
+    for (x, _) in add {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend(add.iter().map(|(_, tbd)| *tbd));
+    v[0] = (v.len() - 1) as u8;
+    v
+}
+
+/// Custom tab stops ([MS-DOC] sprmPChgTabsPapx, sprmPChgTabs) were skipped, so tab-aligned text
+/// (centred titles, right-aligned dates, dot leaders in forms) lost its alignment. Stops added by
+/// a style and by the paragraph, stops it removes, and the TBD's alignment and leader are read.
+#[test]
+fn tab_stops_read_from_styles_and_paragraphs() {
+    use wordcraft_doc::props::{TabAlign, TabLeader};
+    // Normal: centre at 3.25" (4680 tw), right at 6.5" (9360 tw) with a dot leader (tlc 1).
+    let normal = grpprl(&[(0xC60D, &tabs_papx(&[], &[(4680, 1), (9360, 2 | 1 << 3)]))]);
+    // The paragraph drops the centre stop and adds a left stop at 0.5" and a bar at 1".
+    let direct = grpprl(&[(0xC60D, &tabs_papx(&[4680], &[(720, 0), (1440, 4)]))]);
+    // The second paragraph uses the older sprmPChgTabs: removals carry a "close" distance.
+    let mut old = vec![0u8, 1];
+    old.extend_from_slice(&9360i16.to_le_bytes());
+    old.extend_from_slice(&25i16.to_le_bytes());
+    old.push(1);
+    old.extend_from_slice(&2880i16.to_le_bytes());
+    old.push(3 | 5 << 3); // decimal, middle dot
+    old[0] = (old.len() - 1) as u8;
+    let spec = RichSpec {
+        text: "\tA\tB\r\tC\r",
+        styles: vec![(1, 0x0FFF, "Normal", normal, Vec::new())],
+        fonts: vec!["Calibri"],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, direct), (5, 0, grpprl(&[(0xC615, &old)]))],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let tabs = |i: usize| {
+        let p = doc.body.get(i).and_then(|b| b.as_para()).expect("para");
+        doc.styles.resolve_para(&p.props).tabs.iter().map(|t| (t.pos, t.align, t.leader)).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        tabs(0),
+        [(36.0, TabAlign::Left, TabLeader::None), (72.0, TabAlign::Bar, TabLeader::None), (468.0, TabAlign::Right, TabLeader::Dot)],
+        "the style's stops, less the removed one, plus the paragraph's"
+    );
+    assert_eq!(tabs(1), [(144.0, TabAlign::Decimal, TabLeader::MiddleDot), (234.0, TabAlign::Center, TabLeader::None)], "sprmPChgTabs");
+    assert_eq!(doc.styles.styles.iter().find(|s| s.name == "Normal").and_then(|s| s.para.tabs.as_ref()).map(Vec::len), Some(2));
+}
+
+/// Hostile tab operands (counts past the end, more than 64 stops, cb 255) never panic and
+/// never swallow the sprms after them.
+#[test]
+fn hostile_tab_operands_are_safe() {
+    for operand in [vec![2u8, 200, 9], vec![0], vec![255, 1, 0x10, 0x00], vec![255, 3], vec![5, 0, 70, 0, 1, 2]] {
+        let papx = grpprl(&[(0xC615, &operand), (0x2403, &[1])]);
+        let spec = RichSpec {
+            text: "x\r",
+            styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+            fonts: vec!["Calibri"],
+            chpx_runs: vec![(0, Vec::new())],
+            papx_entries: vec![(0, 0, papx)],
+        };
+        let _ = read(&rich_doc(&spec));
+    }
+    let mut iter = crate::sprm::iter(&[0x15, 0xC6, 3, 0, 0, 0, 0x03, 0x24, 1]);
+    assert_eq!(iter.next().map(|p| (p.op, p.operand.len())), Some((0xC615, 4)), "cb is one byte: the operand is cb + 1 bytes");
+    assert_eq!(iter.next().map(|p| p.op), Some(0x2403), "the next sprm is still read");
+}
+
+/// A section mark (0x0C) at a section's end is the section's last paragraph mark, not a page
+/// break inside a paragraph: the section's properties (here continuous) land on that paragraph.
+/// Before, every section of such a file was lost and each section mark became a page break.
+#[test]
+fn section_marks_end_paragraphs() {
+    use wordcraft_doc::section::SectionStart;
+    let spec = StructSpec {
+        text: "first\u{C}second\r",
+        header_stories: vec![],
+        sections: vec![(6, grpprl(&[(0x3009, &[0x00])])), (13, Vec::new())],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, Vec::new()), (6, 0, Vec::new())],
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    assert_eq!(body_texts(&doc), ["first", "second"]);
+    let p0 = doc.body.first().and_then(|b| b.as_para()).expect("para");
+    assert_eq!(p0.section.as_ref().map(|s| s.start), Some(SectionStart::Continuous), "the section ends at its mark");
+    // A page break inside a section stays a page break.
+    let spec = StructSpec { text: "a\u{C}b\r", sections: vec![(4, Vec::new())], papx_entries: vec![(0, 0, Vec::new())], ..spec };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    assert_eq!(body_texts(&doc), ["a\u{C}b"]);
 }

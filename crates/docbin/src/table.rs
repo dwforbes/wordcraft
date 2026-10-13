@@ -209,7 +209,7 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
         if blocks.is_empty() {
             blocks.push(para_block(Paragraph::new()));
         }
-        cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks });
+        cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default() });
     }
     fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> Row {
         // Per-cell overrides first (sprm cell indices count pre-merge cells), then merges.
@@ -244,7 +244,17 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
                 }
             }
         }
-        Row { props: RowProps { height: info.height, height_rule: info.height_rule, header: info.header, cant_split: info.cant_split }, cells }
+        Row {
+            props: RowProps {
+                height: info.height,
+                height_rule: info.height_rule,
+                header: info.header,
+                cant_split: info.cant_split,
+                fmt_change: None,
+            },
+            cells,
+            controls: Default::default(),
+        }
     }
     fn flush_table(out: &mut Blocks, rows: &mut Vec<Row>, cells: &mut Vec<Cell>, cell: &mut Blocks, grid: &[f32], props: &TableProps, nested: bool) {
         if !cells.is_empty() || !cell.is_empty() {
@@ -269,7 +279,12 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
                 }
             }
         } else {
-            out.push(Arc::new(Block::Table(Table { props: props.clone(), grid: grid.to_vec(), rows: std::mem::take(rows) })));
+            out.push(Arc::new(Block::Table(Table {
+                props: props.clone(),
+                grid: grid.to_vec(),
+                rows: std::mem::take(rows),
+                controls: Default::default(),
+            })));
         }
         rows.clear();
     }
