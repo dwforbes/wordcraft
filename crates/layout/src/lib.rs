@@ -172,6 +172,9 @@ pub struct LayoutOptions {
     /// typing pauses, as in Word, since checking a long paragraph's grammar costs more than
     /// the rest of a keystroke. Its spelling still is.
     pub grammar_paused: Option<u64>,
+    /// The word being typed: (paragraph rev, caret offset). A spelling mark on the word that
+    /// ends at or contains the caret waits until the word is finished, as in Word.
+    pub typing_at: Option<(u64, usize)>,
 }
 
 /// File › Options › Proofing choices that change the squiggles.
@@ -729,7 +732,7 @@ impl Ctx<'_> {
         self.cache.used.insert(key.clone());
         if let Some(pl) = self.cache.paras.get(&key) {
             self.cache.hits += 1;
-            return pl.clone();
+            return self.hold_typed_word(p, pl.clone());
         }
         self.cache.misses += 1;
         let env = para::ParaEnv {
@@ -751,7 +754,20 @@ impl Ctx<'_> {
         };
         let pl = Arc::new(para::layout_para(p, &env));
         self.cache.paras.insert(key, pl.clone());
-        pl
+        self.hold_typed_word(p, pl)
+    }
+
+    /// `pl` without the spelling mark on the word being typed ([`LayoutOptions::typing_at`]).
+    /// The cached layout keeps it, so the mark shows as soon as the word is finished.
+    fn hold_typed_word(&self, p: &Paragraph, pl: Arc<ParaLayout>) -> Arc<ParaLayout> {
+        let Some((rev, off)) = self.opts.typing_at else { return pl };
+        let held = |&(s, e, grammar): &(usize, usize, bool)| !grammar && s < off && off <= e;
+        if rev != p.rev || !pl.issues.iter().any(held) {
+            return pl;
+        }
+        let mut l = (*pl).clone();
+        l.issues.retain(|i| !held(i));
+        Arc::new(l)
     }
 }
 

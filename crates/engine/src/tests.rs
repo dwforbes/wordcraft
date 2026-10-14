@@ -5511,3 +5511,38 @@ fn grammar_waits_for_typing_to_pause() {
     assert!(spelling == 1 && grammar > 0, "{spelling} {grammar}");
     assert_eq!(s.grammar_check_in_ms(), None);
 }
+
+/// The word being typed isn't marked misspelled before it is finished: its mark shows once a
+/// space or punctuation follows, or the caret leaves it (a key or a click).
+#[test]
+fn spelling_waits_for_the_word_to_be_finished() {
+    let mut s = Session::new(wordcraft_doc::Document::new());
+    s.view.proofing = true;
+    s.hold_typed_word = true;
+    let spelling = |s: &mut Session| {
+        let l = s.layout();
+        l.pages
+            .iter()
+            .flat_map(|p| &p.items)
+            .filter_map(
+                |it| if let wordcraft_layout::Placed::Lines { para, .. } = it { Some(para.issues.iter().filter(|i| !i.2).count()) } else { None },
+            )
+            .sum::<usize>()
+    };
+    for ch in ["T", "h", "e", " ", "w", "r", "o", "d"] {
+        s.run("text.insert", &json!({"text": ch})).unwrap();
+    }
+    assert_eq!(spelling(&mut s), 0, "\"wrod\" is still being typed");
+    s.run("text.insert", &json!({"text": " "})).unwrap();
+    assert_eq!(spelling(&mut s), 1, "a space finishes it");
+    s.run("text.insert", &json!({"text": "blorfle"})).unwrap();
+    assert_eq!(spelling(&mut s), 1);
+    s.run("caret.left", &json!({})).unwrap();
+    assert_eq!(spelling(&mut s), 2, "moving off it finishes it");
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " zibbet"})).unwrap();
+    assert_eq!(spelling(&mut s), 2);
+    // A click elsewhere sets the selection directly.
+    s.sel = crate::Selection::caret(Pos::body(0, 0));
+    assert_eq!(spelling(&mut s), 3, "a click away finishes it");
+}

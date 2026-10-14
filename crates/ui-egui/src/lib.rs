@@ -491,6 +491,7 @@ impl WordApp {
             wordcraft_engine::set_system_locale(&tag);
         }
         session.grammar_pause_ms = GRAMMAR_PAUSE_MS;
+        session.hold_typed_word = true;
         WordApp {
             session,
             ui: UiState::default(),

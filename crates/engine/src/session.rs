@@ -394,6 +394,12 @@ pub struct Session {
     edited: (u64, f64),
     /// The paragraph (rev) the cached layout left grammar out of.
     layout_paused: Option<u64>,
+    /// Don't mark the word being typed as misspelled until it is finished (the editor sets it).
+    pub hold_typed_word: bool,
+    /// The word the cached layout held its spelling mark on.
+    layout_typing: Option<(u64, usize)>,
+    /// Where the caret was after the last typing (a click elsewhere leaves the word typed).
+    typed_at: Option<Pos>,
     /// Picture edits: edited media key → original media key (Reset Picture).
     pub originals: std::collections::HashMap<String, String>,
     /// Last mutating command (Repeat).
@@ -612,6 +618,9 @@ impl Session {
             grammar_pause_ms: 0.0,
             edited: (0, 0.0),
             layout_paused: None,
+            hold_typed_word: false,
+            layout_typing: None,
+            typed_at: None,
             originals: Default::default(),
             last_command: None,
             recording: None,
@@ -758,8 +767,17 @@ impl Session {
         let deleted = (hide_deleted, self.revisions_in_balloons());
         let outline = (mode == ViewMode::Outline).then(|| self.view.outline.view());
         let paused = self.grammar_paused();
+        // A typing run with the caret after what it typed: that word isn't finished yet.
+        let typing = (self.hold_typed_word
+            && self.typing_open
+            && self.view.proofing
+            && self.sel.is_collapsed()
+            && self.typed_at.as_ref() == Some(&self.sel.focus))
+        .then(|| self.doc.para_at(&self.sel.focus).map(|p| (p.rev, self.sel.focus.off)))
+        .flatten();
         if let Some((r, w, h, m, sp, l, pf, o, hd, n)) = &self.layout
             && self.layout_paused == paused
+            && self.layout_typing == typing
             && *r == self.rev
             && (*w == width || mode == ViewMode::Print)
             && *h == height
@@ -787,9 +805,11 @@ impl Session {
             outline: outline.clone(),
             proof: wordcraft_layout::ProofOptions { grammar: self.prefs.mark_grammar, spelling: self.prefs.spelling() },
             grammar_paused: paused,
+            typing_at: typing,
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
         self.layout_paused = paused;
+        self.layout_typing = typing;
         self.layout = Some((self.rev, width, height, mode, spacing, l.clone(), self.view.proofing, outline, deleted, self.view.numeral));
         l
     }
@@ -1126,6 +1146,9 @@ impl Session {
             grammar_pause_ms: _,
             edited: _,
             layout_paused: _,
+            hold_typed_word: _,
+            layout_typing: _,
+            typed_at: _,
             originals: _,
             last_command: _,
             recording: _,
@@ -1356,6 +1379,9 @@ impl Session {
                 }
                 self.status = e.to_string();
             }
+        }
+        if typing && result.is_ok() {
+            self.typed_at = Some(self.sel.focus.clone());
         }
         result
     }
