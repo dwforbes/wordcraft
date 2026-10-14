@@ -485,11 +485,12 @@ impl SaveChoice {
 }
 
 impl WordApp {
-    pub fn new(session: Session, services: Services) -> Self {
+    pub fn new(mut session: Session, services: Services) -> Self {
         // Numeral › System follows the system locale, found here rather than in layout.
         if let Some(tag) = sys_locale::get_locale() {
             wordcraft_engine::set_system_locale(&tag);
         }
+        session.grammar_pause_ms = GRAMMAR_PAUSE_MS;
         WordApp {
             session,
             ui: UiState::default(),
@@ -1969,6 +1970,10 @@ fn discards_document(id: &str, params: &Value) -> bool {
         _ => false,
     }
 }
+
+/// The paragraph being typed in gets its grammar check once typing has paused this long, as
+/// in Word: checking a long paragraph's grammar on every key cost more than the rest of it.
+pub const GRAMMAR_PAUSE_MS: f64 = 600.0;
 
 /// Wall-clock milliseconds since the Unix epoch: the system clock, or the browser's on the web.
 pub fn now_ms() -> f64 {

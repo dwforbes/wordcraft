@@ -751,6 +751,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     }
     crate::ink::replay_tick(app, ui.ctx());
     let layout = app.session.layout();
+    // The paragraph being typed in gets its grammar squiggles when typing pauses.
+    if let Some(ms) = app.session.grammar_check_in_ms() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms.clamp(0.0, 60_000.0) as u64 + 1));
+    }
     if let Some(anchor) = reflow_anchor
         && let Some(page) = reading_anchor_page(&layout, &anchor)
     {

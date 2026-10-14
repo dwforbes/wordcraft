@@ -5482,3 +5482,32 @@ fn exported_page_images_draw_headers_at_full_strength() {
     assert!(darkest < 60, "header drawn dimmed: darkest pixel {darkest}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Typing doesn't wait for the grammar check: within the pause after an edit, the caret's
+/// paragraph is laid out with its spelling marks but not its grammar ones; other paragraphs
+/// keep theirs, and the paragraph gets them once the pause is over.
+#[test]
+fn grammar_waits_for_typing_to_pause() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("I could of done it, wrod.\nShe could of gone."));
+    s.view.proofing = true;
+    // (spelling, grammar) marks of body paragraph `i`.
+    let marks = |s: &mut Session, i: usize| {
+        let l = s.layout();
+        let para = l.pages.iter().flat_map(|p| &p.items).find_map(|it| match it {
+            wordcraft_layout::Placed::Lines { story: StoryRef::Body, path, para, .. } if path.0 == [i as u32] => Some(para.clone()),
+            _ => None,
+        });
+        let issues = para.map(|p| p.issues.clone()).unwrap_or_default();
+        (issues.iter().filter(|i| !i.2).count(), issues.iter().filter(|i| i.2).count())
+    };
+    s.grammar_pause_ms = 1e9;
+    s.run("text.insert", &json!({"text": "A "})).unwrap();
+    assert_eq!(marks(&mut s, 0), (1, 0), "spelling stays, grammar waits");
+    assert!(s.grammar_check_in_ms().is_some_and(|ms| ms > 0.0));
+    assert_eq!(marks(&mut s, 1).1, 1, "other paragraphs keep their grammar marks");
+    // The pause is over.
+    s.grammar_pause_ms = 0.0;
+    let (spelling, grammar) = marks(&mut s, 0);
+    assert!(spelling == 1 && grammar > 0, "{spelling} {grammar}");
+    assert_eq!(s.grammar_check_in_ms(), None);
+}

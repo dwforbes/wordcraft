@@ -387,6 +387,13 @@ pub struct Session {
         (bool, bool),
         NumeralMode,
     )>,
+    /// For this long after an edit, the paragraph being typed in is laid out without its
+    /// grammar check (0: never). The editor sets it; headless sessions check everything.
+    pub grammar_pause_ms: f64,
+    /// (revision, when a layout first saw it): when the document last changed.
+    edited: (u64, f64),
+    /// The paragraph (rev) the cached layout left grammar out of.
+    layout_paused: Option<u64>,
     /// Picture edits: edited media key → original media key (Reset Picture).
     pub originals: std::collections::HashMap<String, String>,
     /// Last mutating command (Repeat).
@@ -602,6 +609,9 @@ impl Session {
             document_id: 1,
             cache: LayoutCache::new(),
             layout: None,
+            grammar_pause_ms: 0.0,
+            edited: (0, 0.0),
+            layout_paused: None,
             originals: Default::default(),
             last_command: None,
             recording: None,
@@ -747,7 +757,9 @@ impl Session {
         let hide_deleted = !self.view.show_markup || self.prefs.markup.hides_deletions();
         let deleted = (hide_deleted, self.revisions_in_balloons());
         let outline = (mode == ViewMode::Outline).then(|| self.view.outline.view());
+        let paused = self.grammar_paused();
         if let Some((r, w, h, m, sp, l, pf, o, hd, n)) = &self.layout
+            && self.layout_paused == paused
             && *r == self.rev
             && (*w == width || mode == ViewMode::Print)
             && *h == height
@@ -774,11 +786,38 @@ impl Session {
             field_codes: self.view.field_codes,
             outline: outline.clone(),
             proof: wordcraft_layout::ProofOptions { grammar: self.prefs.mark_grammar, spelling: self.prefs.spelling() },
+            grammar_paused: paused,
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
+        self.layout_paused = paused;
         self.layout = Some((self.rev, width, height, mode, spacing, l.clone(), self.view.proofing, outline, deleted, self.view.numeral));
         l
     }
+    /// The paragraph whose grammar check waits for typing to pause ([`Session::grammar_pause_ms`]):
+    /// the caret's, within the pause after the last edit.
+    fn grammar_paused(&mut self) -> Option<u64> {
+        if self.grammar_pause_ms <= 0.0 || !self.view.proofing || !self.prefs.mark_grammar {
+            return None;
+        }
+        let now = wordcraft_layout::now_ms();
+        if self.edited.0 != self.rev {
+            self.edited = (self.rev, now);
+        }
+        let since = now - self.edited.1;
+        // A clock that went backwards ends the pause too.
+        if !(0.0..self.grammar_pause_ms).contains(&since) {
+            return None;
+        }
+        self.doc.para_at(&self.sel.focus).map(|p| p.rev)
+    }
+
+    /// How long until the paragraph being typed in gets its grammar check, if the current
+    /// layout left it out: the editor redraws then.
+    pub fn grammar_check_in_ms(&self) -> Option<f64> {
+        self.layout_paused?;
+        Some((self.edited.1 + self.grammar_pause_ms - wordcraft_layout::now_ms()).max(0.0))
+    }
+
     /// A layout for output (PDF, images, print): no proofing marks, print view.
     pub fn export_layout(&self) -> Arc<DocLayout> {
         self.export_layout_with(false)
@@ -1084,6 +1123,9 @@ impl Session {
             rev: _,
             cache: _,
             layout: _,
+            grammar_pause_ms: _,
+            edited: _,
+            layout_paused: _,
             originals: _,
             last_command: _,
             recording: _,

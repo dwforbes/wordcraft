@@ -168,6 +168,10 @@ pub struct LayoutOptions {
     pub outline: Option<outline::OutlineView>,
     /// What the spelling check skips, and whether grammar is marked too (File › Options › Proofing).
     pub proof: ProofOptions,
+    /// The paragraph (by [`Paragraph::rev`]) being typed in: its grammar isn't checked until
+    /// typing pauses, as in Word, since checking a long paragraph's grammar costs more than
+    /// the rest of a keystroke. Its spelling still is.
+    pub grammar_paused: Option<u64>,
 }
 
 /// File › Options › Proofing choices that change the squiggles.
@@ -455,6 +459,8 @@ struct Key {
     grid: (u32, u32, u32, bool),
     fit: bool,
     hide_deleted: bool,
+    /// Laid out without grammar ([`LayoutOptions::grammar_paused`]).
+    no_grammar: bool,
 }
 
 /// Memoised paragraph layouts.
@@ -717,7 +723,9 @@ impl Ctx<'_> {
             grid: self.grid.key(),
             fit: self.boxes.inside(),
             hide_deleted: self.hide_deleted,
+            no_grammar: self.opts.grammar_paused == Some(p.rev),
         };
+        let no_grammar = key.no_grammar;
         self.cache.used.insert(key.clone());
         if let Some(pl) = self.cache.paras.get(&key) {
             self.cache.hits += 1;
@@ -733,7 +741,7 @@ impl Ctx<'_> {
             field_codes: self.opts.field_codes,
             hide_deleted: self.hide_deleted,
             table,
-            proofing: self.opts.proofing.then_some(self.opts.proof),
+            proofing: self.opts.proofing.then_some(ProofOptions { grammar: self.opts.proof.grammar && !no_grammar, ..self.opts.proof }),
             numeral: self.opts.numeral,
             exclusions,
             eq_number,
@@ -3153,6 +3161,7 @@ fn next_first_line(ctx: &mut Ctx, block: usize, width: f32, depth: usize) -> f32
                 grid: ctx.grid.key(),
                 fit: false,
                 hide_deleted: env.hide_deleted,
+                no_grammar: false,
             };
             let pl = match ctx.cache.ahead.get(&key) {
                 Some(pl) => pl.clone(),
