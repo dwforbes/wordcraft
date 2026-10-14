@@ -193,6 +193,7 @@ pub fn image_cache_usage() -> (usize, usize) {
 pub fn clear_image_cache() {
     *lock(images()) = MediaCache::default();
     *lock(vectors()) = MediaCache::default();
+    lock(strokes()).clear();
 }
 
 /// Decode an encoded image to a premultiplied pixmap.
@@ -577,6 +578,35 @@ fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordc
     }
 }
 
+/// Glyph outlines grown by a stroke, by (face, glyph, stroke width in font units, join).
+fn strokes() -> &'static Mutex<HashMap<(u32, u32, u64, bool), Arc<BezPath>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<(u32, u32, u64, bool), Arc<BezPath>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// At most this many stroked glyphs are kept (a few MB): a page of text uses some hundreds.
+const MAX_STROKES: usize = 4096;
+
+/// The area a `width` stroke of glyph outline `o` (font units) covers, to be filled with the
+/// non-zero rule like a stroke. Fitting a stroke's offset curves costs far more than filling,
+/// and every glyph of a page was stroked again on each redraw (stem darkening, synthetic bold),
+/// so each glyph is stroked once per width and kept.
+fn stroked_outline(face: u32, gid: u32, o: &BezPath, width: f64, join: kurbo::Join) -> Arc<BezPath> {
+    let key = (face, gid, width.to_bits(), join == kurbo::Join::Round);
+    if let Some(p) = lock(strokes()).get(&key) {
+        return p.clone();
+    }
+    // A tenth of the stroke's width: under 0.03 px for stem darkening.
+    let tolerance = (width * 0.1).clamp(0.05, 2.0);
+    let p = Arc::new(kurbo::stroke(o.iter(), &kurbo::Stroke::new(width).with_join(join), &kurbo::StrokeOpts::default(), tolerance));
+    let mut c = lock(strokes());
+    if c.len() >= MAX_STROKES {
+        c.clear();
+    }
+    c.insert(key, p.clone());
+    p
+}
+
 /// How far, in device pixels, macOS-style font smoothing pushes each side of a glyph outline out
 /// at `ppem` device pixels per em. Values from Pathfinder (MIT/Apache-2.0), which measured them
 /// against macOS: 1.21% of the pixel size horizontally and 1.25 times that vertically, each
@@ -593,6 +623,8 @@ pub fn stem_darkening(ppem: f64) -> f64 {
 }
 
 /// A wavy line from `a` to `b` at height `y`; at most 20 000 units long, so a huge extent can't make it endless.
+/// Each half wave is three straight pieces along the curve it stands for: stroking lines is
+/// cheap, where stroking curves (fitting their offsets) cost more than the page's text.
 fn wave_path(a: f64, b: f64, y: f64, amp: f64) -> BezPath {
     let step = amp * 2.0;
     let mut p = BezPath::new();
@@ -605,7 +637,12 @@ fn wave_path(a: f64, b: f64, y: f64, amp: f64) -> BezPath {
         if nx <= x {
             break;
         }
-        p.quad_to(((x + nx) / 2.0, if up { y - amp } else { y + amp }), (nx, y));
+        let cy = if up { y - amp } else { y + amp };
+        for t in [1.0 / 3.0, 2.0 / 3.0, 1.0] {
+            // The quadratic from (x, y) through control ((x + nx) / 2, cy) to (nx, y).
+            let u = 1.0 - t;
+            p.line_to((u * u * x + 2.0 * u * t * (x + nx) / 2.0 + t * t * nx, u * u * y + 2.0 * u * t * cy + t * t * y));
+        }
         x = nx;
         up = !up;
     }
@@ -648,7 +685,7 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 let (a, b) = ((*x0).min(*x1) as f64, (*x0).max(*x1) as f64);
                 let amp = (w * 1.2).max(0.8);
                 let p = wave_path(a, b, *y0 as f64, amp);
-                ctx.set_stroke(kurbo::Stroke::new(w * 0.8));
+                ctx.set_stroke(kurbo::Stroke::new(w * 0.8).with_join(kurbo::Join::Miter));
                 ctx.stroke_path(&p);
                 return;
             }
@@ -677,10 +714,7 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
             let darken_px = if opts.text_darkening && *alpha >= 1.0 { stem_darkening(*size as f64 * px_per_pt) } else { 0.0 };
             let darken = if darken_px > 0.0 && k * px_per_pt > 0.0 { 2.0 * darken_px / (k * px_per_pt) } else { 0.0 };
             let outline_stroke = if *synth_bold { face.upem * 0.03 } else { 0.0 } + darken;
-            if outline_stroke > 0.0 {
-                let join = if darken > 0.0 { kurbo::Join::Round } else { kurbo::Join::Miter };
-                ctx.set_stroke(kurbo::Stroke::new(outline_stroke).with_join(join));
-            }
+            let join = if darken > 0.0 { kurbo::Join::Round } else { kurbo::Join::Miter };
             for (gid, x, y) in glyphs {
                 let (gx, gy) = (*x as f64, *y as f64);
                 // Written so a NaN position is skipped too.
@@ -695,7 +729,7 @@ fn draw(ctx: &mut RenderContext, doc: &Document, it: &Draw, view: Affine, visibl
                 ctx.set_transform(view * Affine::translate((gx, gy)) * skew * Affine::scale(k));
                 ctx.fill_path(&o);
                 if outline_stroke > 0.0 {
-                    ctx.stroke_path(&o);
+                    ctx.fill_path(&stroked_outline(face.id(), *gid, &o, outline_stroke, join));
                 }
             }
         }

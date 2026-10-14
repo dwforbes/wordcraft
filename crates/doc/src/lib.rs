@@ -919,7 +919,28 @@ impl Document {
     pub fn story_word_count(&self, s: StoryRef) -> usize {
         let Some(bl) = self.story(s) else { return 0 };
         let mut counters = numbering::Counters::default();
-        story_word_count_of(bl, &self.numbering, &self.styles, &mut counters, 0)
+        story_word_count_of(bl, &self.numbering, &self.styles, &mut counters, &mut |p| count_words(&p.plain_text()), 0)
+    }
+
+    /// [`Self::word_count`] (or with `notes`, [`Self::word_count_including_notes`]) counting
+    /// again only the paragraphs changed since the last call with this `cache`: a keystroke in
+    /// a long document recounts one paragraph, not all of them.
+    pub fn word_count_cached(&self, notes: bool, cache: &mut WordCountCache) -> usize {
+        let stories = if notes { self.counted_stories() } else { vec![StoryRef::Body] };
+        let old = std::mem::take(&mut cache.words);
+        let mut words = |p: &Paragraph| {
+            let n = old.get(&p.rev).copied().unwrap_or_else(|| count_words(&p.plain_text()));
+            cache.words.insert(p.rev, n);
+            n
+        };
+        let mut total = 0usize;
+        for s in stories {
+            if let Some(bl) = self.story(s) {
+                let mut counters = numbering::Counters::default();
+                total = total.saturating_add(story_word_count_of(bl, &self.numbering, &self.styles, &mut counters, &mut words, 0));
+            }
+        }
+        total
     }
 
     /// The body, then the text boxes, footnotes and endnotes it shows (nested ones too), in
@@ -1333,7 +1354,21 @@ fn text_of(bl: &Blocks, out: &mut String, depth: usize, shown: bool) {
     }
 }
 
-fn story_word_count_of(bl: &Blocks, numbering: &Numbering, styles: &styles::StyleSheet, counters: &mut numbering::Counters, depth: usize) -> usize {
+/// Words per paragraph revision, for [`Document::word_count_cached`]. Holds only the paragraphs
+/// of the last count.
+#[derive(Debug, Default)]
+pub struct WordCountCache {
+    words: std::collections::HashMap<u64, usize>,
+}
+
+fn story_word_count_of(
+    bl: &Blocks,
+    numbering: &Numbering,
+    styles: &styles::StyleSheet,
+    counters: &mut numbering::Counters,
+    words: &mut dyn FnMut(&Paragraph) -> usize,
+    depth: usize,
+) -> usize {
     if depth > 16 {
         return 0;
     }
@@ -1348,12 +1383,12 @@ fn story_word_count_of(bl: &Blocks, numbering: &Numbering, styles: &styles::Styl
                 {
                     total = total.saturating_add(count_words(&label));
                 }
-                total = total.saturating_add(count_words(&p.plain_text()));
+                total = total.saturating_add(words(p));
             }
             Block::Table(t) => {
                 for row in &t.rows {
                     for c in &row.cells {
-                        total = total.saturating_add(story_word_count_of(&c.blocks, numbering, styles, counters, depth + 1));
+                        total = total.saturating_add(story_word_count_of(&c.blocks, numbering, styles, counters, words, depth + 1));
                     }
                 }
             }

@@ -461,6 +461,9 @@ struct Key {
 #[derive(Default)]
 pub struct LayoutCache {
     paras: HashMap<Key, Arc<ParaLayout>>,
+    /// Lookahead layouts of the paragraph after a keep-with-next one (no label, no proofing),
+    /// so headings don't lay out the paragraph after them again on every pass.
+    ahead: HashMap<Key, Arc<ParaLayout>>,
     /// Outlines of pictures' opaque pixels (Tight and Through wrapping), by media key, the
     /// media's bytes (address and length) and crop.
     outlines: HashMap<(String, usize, usize, [u32; 4]), Option<Arc<Vec<(f32, f32)>>>>,
@@ -482,6 +485,7 @@ impl LayoutCache {
     }
     pub fn clear(&mut self) {
         self.paras.clear();
+        self.ahead.clear();
         self.outlines.clear();
     }
 }
@@ -1765,6 +1769,7 @@ fn layout_pass(
     let env = env_hash(doc, opts);
     if env != cache.env {
         cache.paras.clear();
+        cache.ahead.clear();
         cache.env = env;
     }
     cache.used.clear();
@@ -3135,7 +3140,32 @@ fn next_first_line(ctx: &mut Ctx, block: usize, width: f32, depth: usize) -> f32
                 fit_objects: false,
             };
             let _ = rp;
-            let pl = para::layout_para(p, &env);
+            let key = Key {
+                rev: p.rev,
+                width: width.to_bits(),
+                label: None,
+                page: if has_page_fields(p) { Some(ctx.fields.page_key()) } else { None },
+                table: 0,
+                notes: if p.objects.iter().any(|o| matches!(o, InlineObject::NoteRef { .. })) { ctx.notes_hash } else { 0 },
+                excl: 0,
+                eq: ctx.eq_count,
+                read_spacing: env.read_line_spacing.map(f32::to_bits),
+                grid: ctx.grid.key(),
+                fit: false,
+                hide_deleted: env.hide_deleted,
+            };
+            let pl = match ctx.cache.ahead.get(&key) {
+                Some(pl) => pl.clone(),
+                None => {
+                    let pl = Arc::new(para::layout_para(p, &env));
+                    // Bounded: a pass needs one per keep-with-next paragraph.
+                    if ctx.cache.ahead.len() >= 4096 {
+                        ctx.cache.ahead.clear();
+                    }
+                    ctx.cache.ahead.insert(key, pl.clone());
+                    pl
+                }
+            };
             if pl.rp.keep_next && depth < 8 {
                 pl.rp.space_before + pl.height + pl.rp.space_after + next_first_line(ctx, block + 1, width, depth + 1)
             } else {

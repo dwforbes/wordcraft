@@ -427,6 +427,8 @@ pub struct WordApp {
     pub quit_requested: bool,
     pub autosave: bool,
     pub word_count: (u64, usize),
+    /// Words per paragraph, so the count after a keystroke recounts one paragraph.
+    pub word_cache: wordcraft_doc::WordCountCache,
     last_autosave: f64,
     /// The tab shown before the Equation tab came up (restored when editing ends).
     pub(crate) equation_prev_tab: Option<String>,
@@ -528,6 +530,7 @@ impl WordApp {
             quit_requested: false,
             autosave: true,
             word_count: (0, 0),
+            word_cache: Default::default(),
             last_autosave: 0.0,
             equation_prev_tab: None,
             smart_art_item: None,

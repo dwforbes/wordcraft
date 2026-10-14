@@ -62,6 +62,21 @@ fn media_cache_counts_the_source_bytes_it_holds() {
 #[test]
 fn wave_stroke_at_a_huge_coordinate_ends() {
     assert!(wave_path(1e20, 2e20, 0.0, 1.0).elements().len() < 3);
-    assert!(wave_path(0.0, 1e20, 0.0, 1.0).elements().len() < 20_100);
+    assert!(wave_path(0.0, 1e20, 0.0, 1.0).elements().len() < 30_100, "three pieces a half wave, 20 000 units at most");
     assert!(wave_path(0.0, 100.0, 0.0, 1.0).elements().len() > 10);
+}
+
+/// A glyph is stroked once per width and the stroke kept: redrawing a page fills the kept
+/// outline instead of fitting the stroke's curves again.
+#[test]
+fn stroked_glyphs_are_kept_per_width() {
+    let o = kurbo::Circle::new((0.0, 0.0), 300.0).to_path(0.1);
+    let a = stroked_outline(u32::MAX, 7, &o, 12.5, kurbo::Join::Round);
+    let b = stroked_outline(u32::MAX, 7, &o, 12.5, kurbo::Join::Round);
+    assert!(Arc::ptr_eq(&a, &b));
+    let c = stroked_outline(u32::MAX, 7, &o, 13.0, kurbo::Join::Round);
+    assert!(!Arc::ptr_eq(&a, &c), "another width is another stroke");
+    // The stroke covers the outline grown by half the width on each side.
+    let r = kurbo::Shape::bounding_box(&*a);
+    assert!((r.width() - 612.5).abs() < 1.0, "{r:?}");
 }

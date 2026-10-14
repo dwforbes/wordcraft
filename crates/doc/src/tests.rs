@@ -339,3 +339,14 @@ fn custom_props_set_get_remove() {
     assert!(!d.remove_custom_prop("other"));
     assert_eq!(d.custom_props.len(), 1);
 }
+
+/// The cached count recounts changed paragraphs only and always agrees with the full count.
+#[test]
+fn cached_word_count_follows_edits() {
+    let mut d = Document::from_text("one two three\nfour five");
+    let mut cache = WordCountCache::default();
+    assert_eq!(d.word_count_cached(false, &mut cache), d.word_count());
+    d.insert_text(&Pos { story: StoryRef::Body, path: Path::top(0), off: 0 }, "zero ", &CharProps::default()).unwrap();
+    assert_eq!(d.word_count_cached(false, &mut cache), 6);
+    assert_eq!(d.word_count_cached(true, &mut cache), d.word_count_including_notes());
+}
