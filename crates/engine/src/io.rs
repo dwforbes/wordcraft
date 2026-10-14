@@ -52,6 +52,9 @@ pub struct ExportOptions {
     pub markup: bool,
     /// With `markup`, show the comments (Track Changes Options › Comments).
     pub comments: bool,
+    /// An `.xml` copy is a Word 2003 XML Document (WordprocessingML 2003) instead of a Word XML
+    /// Document (Flat OPC): `format: "wordml2003"` on the save commands.
+    pub word2003: bool,
 }
 
 /// A document password: wiped from memory when dropped, never printed (`Debug` shows `***`).
@@ -402,6 +405,18 @@ pub fn read_file_capped(path: &str, max: u64, what: &str) -> Result<Vec<u8>, Str
         return Err(format!("{path}: the {what} is larger than {} MB", max >> 20));
     }
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+}
+
+/// At most the first `max` bytes of the file at `path` (sniffing a file's kind), through the
+/// automation read root like [`read_file`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_file_head(path: &str, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    crate::file_access::check_read(path)?;
+    let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut head = Vec::new();
+    f.take(max).read_to_end(&mut head).map_err(|e| format!("{path}: {e}"))?;
+    Ok(head)
 }
 
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
