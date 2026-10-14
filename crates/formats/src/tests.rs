@@ -515,6 +515,21 @@ fn hostile_rtf_bits() {
     }
 }
 
+/// A document starting with a rule or a `+++` paragraph, with another further on, read back
+/// as front matter and lost what lay between (found by `fuzz_markdown_notes_and_mdx`).
+#[test]
+fn markdown_first_line_never_becomes_front_matter() {
+    for md in ["***\n\nkept [^r]\n\n---\n\n[^r]: note\n", "\\+++\n\nkept\n\n\\+++\n"] {
+        let d = import("md", md.as_bytes()).unwrap().unwrap();
+        let out = export("md", &d).unwrap().unwrap();
+        let again = import("md", &out).unwrap().unwrap();
+        let text = |d: &wordcraft_doc::Document| d.plain_text(wordcraft_doc::StoryRef::Body);
+        assert_eq!(text(&again), text(&d), "{}", String::from_utf8_lossy(&out));
+        assert!(text(&again).contains("kept"));
+        assert_eq!(again.parts.len(), d.parts.len());
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig { cases: 128, ..Default::default() })]
 

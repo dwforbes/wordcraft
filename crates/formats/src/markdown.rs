@@ -1702,6 +1702,17 @@ fn export_with(doc: &Document, mdx: bool) -> String {
     let mut ex = Ex { mdx, ..Default::default() };
     note_labels(&flow.blocks, &mut ex.taken, 0);
     write_blocks(&flow.blocks, &mut out, &mut ex);
+    // A first line of `---` or `+++` that isn't front matter would be read back as front matter
+    // reaching to the next such line, taking the text between with it.
+    if flow.meta.front_matter.is_empty()
+        && let Some(first) = out.first_mut()
+    {
+        match first.trim_end() {
+            "---" => *first = "***".to_string(),
+            "+++" => *first = "\\+++".to_string(),
+            _ => {}
+        }
+    }
     while out.last().is_some_and(|l| l.is_empty()) {
         out.pop();
     }
